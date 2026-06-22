@@ -66,3 +66,193 @@ describe('aem2prose', () => {
     expect(icons.length).to.equal(9);
   });
 });
+
+describe('prose2aem with isFragment parameter', () => {
+  let originalDoc;
+
+  before(async () => {
+    // Reload the HTML for fragment tests
+    const htmlStr = await readFile({ path: './mocks/prose2aem.html' });
+    originalDoc = new DOMParser().parseFromString(htmlStr, 'text/html');
+  });
+
+  it('Returns HTML string when isFragment is true', () => {
+    const fragment = document.createElement('div');
+    fragment.innerHTML = '<div class="tableWrapper"><table><tr><td>Test</td></tr></table></div>';
+
+    const result = prose2aem(fragment, true, true);
+
+    expect(typeof result).to.equal('string');
+    expect(result).to.be.a('string');
+  });
+
+  it('Returns full HTML document when isFragment is false', () => {
+    const newDoc = originalDoc.cloneNode(true);
+    const result = prose2aem(newDoc.body, true, false);
+
+    expect(typeof result).to.equal('string');
+    expect(result).to.include('<body>');
+    expect(result).to.include('</body>');
+  });
+
+  it('Converts blocks correctly in fragment mode', () => {
+    const fragment = document.createElement('div');
+    fragment.innerHTML = `
+      <div class="tableWrapper">
+        <table>
+          <tr><td>marquee (light)</td></tr>
+          <tr><td>Content here</td></tr>
+        </table>
+      </div>
+    `;
+
+    const result = prose2aem(fragment, true, true);
+
+    expect(result).to.include('class="marquee light"');
+    expect(result).to.include('Content here');
+  });
+
+  it('Does not create sections when isFragment is true', () => {
+    const fragment = document.createElement('div');
+    fragment.innerHTML = `
+      <p>First paragraph</p>
+      <hr>
+      <p>Second paragraph</p>
+    `;
+
+    const result = prose2aem(fragment, true, true);
+
+    // Should not wrap content in sections
+    expect(result).to.not.include('<div>');
+    expect(result).to.include('<p>First paragraph</p>');
+    expect(result).to.include('<p>Second paragraph</p>');
+  });
+
+  it('Creates sections when isFragment is false', () => {
+    const newDoc = originalDoc.cloneNode(true);
+    const result = prose2aem(newDoc.body, true, false);
+
+    // Should include section divs
+    expect(result).to.include('<div>');
+  });
+
+  it('Does not remove class attribute when isFragment is true', () => {
+    const fragment = document.createElement('div');
+    fragment.className = 'test-fragment';
+    fragment.innerHTML = '<p>Content</p>';
+
+    const result = prose2aem(fragment, true, true);
+
+    // Class should remain on the fragment in isFragment mode
+    expect(result).to.include('Content');
+  });
+
+  it('Processes table blocks correctly in fragment mode', () => {
+    const fragment = document.createElement('div');
+    fragment.innerHTML = `
+      <div class="tableWrapper">
+        <table>
+          <tr><td>columns (contained)</td></tr>
+          <tr>
+            <td><p>Column 1</p></td>
+            <td><p>Column 2</p></td>
+          </tr>
+        </table>
+      </div>
+    `;
+
+    const result = prose2aem(fragment, true, true);
+
+    expect(result).to.include('class="columns contained"');
+    expect(result).to.include('Column 1');
+    expect(result).to.include('Column 2');
+  });
+
+  it('Handles empty fragment', () => {
+    const fragment = document.createElement('div');
+
+    const result = prose2aem(fragment, true, true);
+
+    expect(result).to.equal('');
+  });
+
+  it('Preserves all images in each column when a column block has 3 columns with multiple images per column', () => {
+    const fragment = document.createElement('div');
+    fragment.innerHTML = `
+      <div class="tableWrapper">
+        <table>
+          <tr><td>columns</td></tr>
+          <tr>
+            <td><p><img src="col1-img1.jpg"><img src="col1-img2.jpg"><img src="col1-img3.jpg"></p></td>
+            <td><p><img src="col2-img1.jpg"><img src="col2-img2.jpg"><img src="col2-img3.jpg"></p></td>
+            <td><p><img src="col3-img1.jpg"><img src="col3-img2.jpg"><img src="col3-img3.jpg"></p></td>
+          </tr>
+        </table>
+      </div>
+    `;
+
+    const result = prose2aem(fragment, true, true);
+
+    const container = document.createElement('div');
+    container.innerHTML = result;
+
+    const block = container.querySelector('.columns');
+    expect(block).to.exist;
+
+    const colDivs = block.querySelectorAll(':scope > div > div');
+    expect(colDivs.length).to.equal(3);
+
+    colDivs.forEach((col, i) => {
+      const pictures = col.querySelectorAll('picture');
+      expect(pictures.length, `column ${i + 1} should have 3 pictures`).to.equal(3);
+    });
+  });
+
+  it('Preserves pictures in fragment mode', () => {
+    const fragment = document.createElement('div');
+    fragment.innerHTML = `
+      <p>
+        <span class="img-wrapper">
+          <img src="test.jpg" alt="Test image">
+        </span>
+      </p>
+    `;
+
+    const result = prose2aem(fragment, true, true);
+
+    expect(result).to.include('<picture>');
+    expect(result).to.include('alt="Test image"');
+  });
+
+  it('Converts focal point attributes to data-title', () => {
+    const fragment = document.createElement('div');
+    fragment.innerHTML = `
+      <p>
+        <img src="test.jpg" data-focal-x="30.5" data-focal-y="70.2">
+      </p>
+    `;
+
+    const result = prose2aem(fragment, true, true);
+
+    expect(result).to.include('data-title="data-focal:30.5,70.2"');
+  });
+
+  it('Unwraps focal point image wrappers', () => {
+    const fragment = document.createElement('div');
+    fragment.innerHTML = `
+      <p>
+        <span class="focal-point-image-wrapper">
+          <img src="test.jpg" data-focal-x="30.5" data-focal-y="70.2">
+          <span class="focal-point-icon"></span>
+        </span>
+      </p>
+    `;
+
+    const result = prose2aem(fragment, true, true);
+
+    expect(result).to.not.include('focal-point-image-wrapper');
+    expect(result).to.not.include('focal-point-icon');
+    expect(result).to.include('<picture>');
+    expect(result).to.include('data-title="data-focal:30.5,70.2"');
+  });
+});

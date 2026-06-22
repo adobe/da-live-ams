@@ -1,24 +1,26 @@
 // eslint-disable-next-line import/no-unresolved
 import { DOMParser } from 'da-y-wrapper';
-import { getDaAdmin } from '../../../shared/constants.js';
 import getPathDetails from '../../../shared/pathDetails.js';
-import { daFetch, getFirstSheet } from '../../../shared/utils.js';
-import { getConfKey, openAssets } from '../../da-assets/da-assets.js';
+import { daFetch, aemAdmin, fetchDaConfigs, getFirstSheet, getSheetByName } from '../../../shared/utils.js';
+import { CON_ORIGIN } from '../../../shared/constants.js';
+import { openAssets } from '../../da-assets/da-assets.js';
 import { fetchKeyAutocompleteData } from '../../prose/plugins/slashMenu/keyAutocomplete.js';
-import { sanitiseRef } from '../../../../scripts/utils.js';
+import { sanitizeName } from '../../../../scripts/utils.js';
+import { getBlocks } from './index.js';
 
-const DA_ORIGIN = getDaAdmin();
+export const OOTB_PLUGINS = ['blocks', 'templates', 'icons', 'placeholders'];
+
+const LIBRARY_CACHE = {};
 const REPLACE_CONTENT = '<content>';
-const DA_CONFIG = '/.da/config.json';
-const DA_PLUGINS = [
-  'blocks',
-  'templates',
-  'aem-assets',
-  'icons',
-  'placeholders',
-];
+const DA_PLUGINS = {
+  blocks: {},
+  templates: {},
+  'aem-assets': { experience: 'assets' },
+  placeholders: {},
+  icons: {},
+};
 
-const ref = sanitiseRef(new URLSearchParams(window.location.search).get('ref')) || 'main';
+export const ref = sanitizeName(new URLSearchParams(window.location.search).get('ref'), false) || 'main';
 
 export function parseDom(dom) {
   const { schema } = window.view.state;
@@ -38,28 +40,49 @@ function formatData(data, format) {
   }, []);
 }
 
-function calculateClass(title) {
-  const lowerName = title.trim().replaceAll(' ', '-').toLowerCase();
-  const isDaPlugin = DA_PLUGINS.some((plugin) => plugin === lowerName);
-  return `${lowerName}${isDaPlugin ? '' : ' is-plugin'}`;
-}
-
 function setupBlockOptions(library) {
   const blockJsonUrl = library.filter((v) => v.name === 'blocks')?.[0]?.sources?.[0];
   if (blockJsonUrl) fetchKeyAutocompleteData(blockJsonUrl);
 }
 
-export async function getItems(sources, listType, format) {
+const AEM_CONTENT_HOST = /\.(ent-)?(aem|hlx)\.(page|live)$/;
+
+export function aemToContentUrl(url) {
+  try {
+    const { hostname, pathname, search } = new URL(url);
+    if (!AEM_CONTENT_HOST.test(hostname)) return url;
+    const parts = hostname.split('--');
+    if (parts.length !== 3) return url;
+    const [, site, orgWithTld] = parts;
+    const [org] = orgWithTld.split('.');
+    return `${CON_ORIGIN}/${org}/${site}${pathname}${search}`;
+  } catch {
+    return url;
+  }
+}
+
+// Try the content.da.live rewrite first; fall back to the original URL on 404
+export async function daFetchLibrary(url, { skipRewrite = false } = {}) {
+  if (skipRewrite) {
+    return { resp: await daFetch(url, { noRedirect: true }), usedFallback: true };
+  }
+  const contentUrl = aemToContentUrl(url);
+  const resp = await daFetch(contentUrl, { noRedirect: true });
+  if (resp.status === 404 && contentUrl !== url) {
+    return { resp: await daFetch(url, { noRedirect: true }), usedFallback: true };
+  }
+  return { resp, usedFallback: false };
+}
+
+export async function getItems(sources, format) {
   const items = [];
   for (const source of sources) {
     try {
-      const resp = await daFetch(source);
+      const { resp, usedFallback } = await daFetchLibrary(source);
       const json = await resp.json();
-      if (json.data) {
-        items.push(...formatData(json.data, format));
-      } else {
-        items.push(...json);
-      }
+      const sheet = json[':type'] === 'multi-sheet' ? json[json[':names']?.[0]] : json;
+      const formatted = sheet?.data ? formatData(sheet.data, format) : json;
+      items.push(...formatted.map((item) => ({ ...item, usedFallback })));
     } catch {
       // couldn't fetch source
     }
@@ -67,65 +90,15 @@ export async function getItems(sources, listType, format) {
   return items;
 }
 
-let currOwner;
-let currRepo;
-let libraries;
-
-async function getDaLibraries(owner, repo) {
-  const resp = await daFetch(`${DA_ORIGIN}/source/${owner}/${repo}${DA_CONFIG}`);
-  if (!resp.ok) return [];
-
-  const json = await resp.json();
-
-  const blockData = getFirstSheet(json);
-  const daLibraries = blockData.reduce((acc, item) => {
-    const keySplit = item.key.split('-');
-    if (keySplit[0] === 'library') {
-      acc.push({
-        name: keySplit[1],
-        class: keySplit[1],
-        sources: item.value.replaceAll(' ', '').split(','),
-        format: item.format,
-      });
-    }
-    return acc;
-  }, []);
-
-  setupBlockOptions(daLibraries);
-
-  return daLibraries;
-}
-
-async function getAemPlugins(owner, repo) {
-  const origin = ref === 'local' ? 'http://localhost:3000' : `https://${ref}--${repo}--${owner}.gov-aem.live`;
-  const confUrl = ref === 'local' ? 'http://localhost:3000/tools/sidekick/config.json' : `https://admin.gov-aem.page/sidekick/${owner}/${repo}/${ref}/config.json`;
-  const resp = await daFetch(confUrl);
-  if (!resp.ok) return [];
-  const json = await resp.json();
-  if (!json || !json.plugins) return [];
-  if (json?.plugins?.length === 0) return [];
-  return json.plugins.reduce((acc, plugin) => {
-    const { environments, path, url: plugUrl, daLibrary } = plugin;
-    const url = path ? `${origin}${path}` : plugUrl;
-    if (environments?.some((env) => env === 'da-edit') || daLibrary) {
-      acc.push({
-        name: plugin.title,
-        icon: plugin.icon,
-        class: `${plugin.title.toLowerCase().replaceAll(' ', '-')} is-plugin`,
-        experience: plugin.experience || 'inline',
-        url,
-      });
-    }
-    return acc;
-  }, []);
-}
-
-async function getAssetsPlugin(owner, repo) {
-  const repoId = await getConfKey(owner, repo, 'aem.repositoryId');
-  if (!repoId) return null;
+async function getAssetsPlugin(org, site) {
+  const configs = await Promise.all(fetchDaConfigs({ org, site }));
+  const entries = configs.reverse().flatMap((config) => getFirstSheet(config) || []);
+  if (!entries.find((conf) => conf.key === 'aem.repositoryId')?.value) return null;
   return {
-    name: 'AEM Assets',
-    class: 'aem-assets',
+    name: 'aem-assets',
+    title: 'AEM Assets',
+    experience: 'aem-assets',
+    icon: '#S2_Icon_Image',
     callback: openAssets,
   };
 }
@@ -158,29 +131,53 @@ function calculateSources(org, repo, sheetPath) {
     if (ref === 'local') return `http://localhost:3000${path}`;
 
     // Fallback to the ref in search param (defaults to main)
-    return `https://${ref}--${repo}--${org}.gov-aem.live${path}`;
+    return `https://${ref}--${repo}--${org}.ent-aem.live${path}`;
   });
 }
 
-async function getConfigLibraries(org, repo) {
-  const resp = await daFetch(`${DA_ORIGIN}/config/${org}/${repo}/`);
-  if (!resp.ok) return null;
-  const { library } = await resp.json();
-  if (!library) return null;
-  return library.data.reduce((acc, plugin) => {
-    const allowed = getIsPluginAllowed(plugin.ref);
+async function fetchLibraryConfig(org, site) {
+  const configs = await fetchDaConfigs({ org, site });
+  const config = await configs[1];
+  if (!config) return [];
+  const libraryData = getSheetByName(config, 'library');
+  if (!libraryData) return [];
+  return libraryData.reduce((acc, row) => {
+    // Determine if a plugin should be visible based on query param
+    const allowed = getIsPluginAllowed(row.ref);
     if (allowed) {
-      const libPlugin = {
-        title: plugin.title.trim(),
-        name: plugin.title.trim().toLowerCase().replaceAll(' ', '-'),
-        class: calculateClass(plugin.title),
-        sources: calculateSources(org, repo, plugin.path),
-        ref: plugin.ref || 'main',
-        experience: plugin.experience || 'inline',
+      const name = row.title.trim().toLowerCase().replaceAll(' ', '-');
+      const ootb = DA_PLUGINS[name];
+      const plugin = {
+        name,
+        title: row.title.trim(),
+        sources: calculateSources(org, site, row.path),
+        ref: row.ref || 'main',
+        experience: ootb?.experience || row.experience || 'inline',
       };
-      if (plugin.format) libPlugin.format = plugin.format;
-      if (plugin.icon) libPlugin.icon = plugin.icon;
-      acc.push(libPlugin);
+
+      if (name === 'blocks') {
+        plugin.loadItems = getBlocks(plugin.sources);
+        plugin.icon = '#S2_Icon_Table';
+      }
+
+      if (name === 'templates') {
+        plugin.loadItems = getItems(plugin.sources);
+        plugin.icon = '#S2_Icon_Template';
+      }
+
+      if (name === 'icons') {
+        plugin.loadItems = getItems(plugin.sources, row.format || ':<content>:');
+        plugin.icon = '#S2_Icon_CallCenter';
+      }
+
+      if (name === 'placeholders') {
+        plugin.loadItems = getItems(plugin.sources, row.format || '{{<content>}}');
+        plugin.icon = '#S2_Icon_Placeholder';
+      }
+
+      // If its not an OOTB plugin, and no provided icon, use the default
+      if (!ootb) plugin.icon = row.icon || '#S2_Icon_Plugin';
+      acc.push(plugin);
     }
     return acc;
   }, []);
@@ -200,45 +197,25 @@ function mergeLibrary(da, assets) {
 }
 
 export async function getLibraryList() {
-  const { owner, repo } = getPathDetails();
-  if (!owner || !repo) return [];
+  const { org, site, fullpath } = getPathDetails();
+  if (!org || !site) return [];
 
-  if (currOwner === owner
-    && currRepo === repo
-    && libraries) {
-    return libraries;
-  }
-  currOwner = owner;
-  currRepo = repo;
-
-  // Attempt config-based library
-  const aemAssets = getAssetsPlugin(owner, repo);
-  const confLibrary = getConfigLibraries(owner, repo);
+  // Fetch in parallel
+  const aemAssets = getAssetsPlugin(org, site);
+  const confLibrary = fetchLibraryConfig(org, site, fullpath);
   const [assets, library] = await Promise.all([aemAssets, confLibrary]);
-  if (library) {
-    setupBlockOptions(library);
-    if (assets) mergeLibrary(library, assets);
-    return library;
-  }
 
-  // Fallback to file-based libary
-  const daLibraries = getDaLibraries(owner, repo);
-  const aemPlugins = getAemPlugins(owner, repo);
+  // Order AEM Assets after blocks or templates
+  if (assets) mergeLibrary(library, assets);
 
-  const [da, aem] = await Promise.all([daLibraries, aemPlugins]);
+  if (library) setupBlockOptions(library);
 
-  if (assets) mergeLibrary(da, assets);
-  return [...da, ...aem];
+  return library;
 }
 
 export function andMatch(inputStr, targetStr) {
   const terms = inputStr.split(' ');
   return terms.every((term) => targetStr.includes(term));
-}
-
-export function delay(ms) {
-  // eslint-disable-next-line no-promise-executor-return
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 export const getMetadata = (el) => [...el.childNodes].reduce((rdx, row) => {
@@ -250,3 +227,87 @@ export const getMetadata = (el) => [...el.childNodes].reduce((rdx, row) => {
   }
   return rdx;
 }, {});
+
+export function getPreviewUrl(previewUrl) {
+  try {
+    const url = new URL(previewUrl);
+
+    if (url.origin.includes('--')) return url.href;
+    if (url.origin.includes('content.ent-da.live')) {
+      const [, org, site, ...split] = url.pathname.split('/');
+      return `https://${ref}--${site}--${org}.ent-aem.page/${split.join('/')}`;
+    }
+    if (url.origin.includes('admin.ent-da.live')) {
+      const [, , org, site, ...split] = url.pathname.split('/');
+      return `https://${ref}--${site}--${org}.ent-aem.page/${split.join('/')}`;
+    }
+  } catch {
+    return false;
+  }
+  return false;
+}
+
+export function getAemUrlVars(url) {
+  try {
+    const urlObj = new URL(url);
+    if (urlObj.origin.includes('--')) {
+      const [branch, site, orgPlus] = urlObj.hostname.split('--');
+      const [org] = orgPlus.split('.');
+      return [org, site, branch];
+    }
+
+    if (urlObj.origin.includes('content.ent-da.live')) {
+      const [, org, site] = urlObj.pathname.split('/');
+      return [org, site, 'main'];
+    }
+    if (urlObj.origin.includes('admin.ent-da.live')) {
+      const [, , org, site] = urlObj.pathname.split('/');
+      return [org, site, 'main'];
+    }
+  } catch {
+    return false;
+  }
+  return false;
+}
+
+export async function loadLibrary() {
+  // Get the current org and site
+  const { owner, repo } = getPathDetails();
+  const sitePath = `/${owner}/${repo}`;
+
+  LIBRARY_CACHE[sitePath] ??= getLibraryList();
+
+  return LIBRARY_CACHE[sitePath];
+}
+
+export function getItemDetails(item) {
+  // Blocks will be path, templates will be value
+  const url = new URL(item.path || item.value);
+  const { hostname, pathname } = url;
+
+  // AEM Flavor
+  if (hostname.includes('.aem.')) {
+    const [org, site] = hostname.split('.')[0].split('--').reverse();
+    return { org, site, pathname };
+  }
+  // DA Content Flavor
+  if (hostname.includes('content.ent-da.live') || hostname.includes('content.da.live')) {
+    const [org, site, ...rest] = pathname.slice(1).split('/');
+    return { org, site, pathname: `/${rest.join('/')}` };
+  }
+  // DA Admin Flavor
+  const [, org, site, ...rest] = pathname.slice(1).split('/');
+  return { org, site, pathname: `/${rest.join('/')}` };
+}
+
+export async function getPreviewStatus({ org, site, pathname }) {
+  const path = `/${org}/${site}${pathname}`;
+  try {
+    const json = await aemAdmin(path, 'status', 'GET');
+    return json.preview.status === 200;
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.log(`Could not get preview status for ${path}`, err);
+    return null;
+  }
+}

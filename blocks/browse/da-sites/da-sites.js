@@ -1,7 +1,8 @@
 import { LitElement, html, nothing } from 'da-lit';
-import getSheet from '../../shared/sheet.js';
+import { getNx, sanitizeName } from '../../../scripts/utils.js';
 
-const sheet = await getSheet('/blocks/browse/da-sites/da-sites.css');
+const { loadStyle } = await import(`${getNx()}/utils/utils.js`);
+const styles = await loadStyle(import.meta.url);
 
 const RANDOM_MAX = 8;
 
@@ -23,40 +24,22 @@ export default class DaSites extends LitElement {
 
   connectedCallback() {
     super.connectedCallback();
-    this.shadowRoot.adoptedStyleSheets = [sheet];
-    this.getRecents();
-  }
-
-  mapRecentSites(recentSites) {
-    this._recents = recentSites.map((name) => (
-      {
-        name,
-        img: `/blocks/browse/da-sites/img/cards/da-${getRandom()}.jpg`,
-        style: `da-card-style-${getRandom()}`,
-      }
-    ));
-  }
-
-  mapRecentOrgs(recentOrgs) {
-    this._recents = recentOrgs.map((name) => (
-      {
-        name,
-        img: `/blocks/browse/da-sites/img/cards/da-${getRandom()}.jpg`,
-        style: `da-card-style-${getRandom()}`,
-      }
-    ));
+    this.shadowRoot.adoptedStyleSheets = [styles];
+    this._recents = this.getRecents();
   }
 
   getRecents() {
     const recentSites = JSON.parse(localStorage.getItem('da-sites')) || [];
-    const recentOrgs = JSON.parse(localStorage.getItem('da-orgs')) || [];
-
     if (recentSites.length > 0) {
-      this.mapRecentSites(recentSites);
-      localStorage.removeItem('da-orgs');
-    } else if (recentOrgs.length > 0) {
-      this.mapRecentOrgs(recentOrgs);
+      return recentSites.map((name) => (
+        {
+          name,
+          img: `/blocks/browse/da-sites/img/cards/da-${getRandom()}.jpg`,
+          style: `da-card-style-${getRandom()}`,
+        }
+      ));
     }
+    return null;
   }
 
   setStatus(text, description, type = 'info') {
@@ -91,10 +74,9 @@ export default class DaSites extends LitElement {
       }
       const helixString = url.hostname.split('.')[0];
       if (!helixString) return null;
-      // eslint-disable-next-line no-unused-vars
-      const [_, repo, org] = helixString.split('--');
-      if (!repo || !org) return null;
-      return `#/${org}/${repo}`;
+      const [, site, org] = helixString.split('--');
+      if (!site || !org) return null;
+      return `#/${sanitizeName(org, false)}/${sanitizeName(site, false)}`;
     } catch (_) {
       return null;
     }
@@ -139,7 +121,8 @@ export default class DaSites extends LitElement {
             @keydown="${() => { this._urlError = false; }}"
             @change="${() => { this._urlError = false; }}" 
             type="text" name="siteUrl" 
-            placeholder="https://main--site--org.aem.page" 
+            aria-label="Site URL"
+            placeholder="https://main--site--org.ent-aem.page" 
             class="${this._urlError ? 'error' : nothing}" 
         />
         <div class="da-form-btn-offset">
@@ -184,7 +167,7 @@ export default class DaSites extends LitElement {
               <span>Hide</span>
             </button>
           </div>
-          <button class="da-site-card-action da-site-card-action-more" @click=${(e) => this.handleFlip(e, site)}>
+          <button class="da-site-card-action da-site-card-action-more" @click=${(e) => this.handleFlip(e, site)} aria-label="More options">
             <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
                 <path fill="currentColor" d="M16,17.51c.83,0,1.5-.67,1.5-1.5s-.67-1.5-1.5-1.5-1.5.67-1.5,1.5.67,1.5,1.5,1.5Z" />
                 <path fill="currentColor" d="M10,17.51c.83,0,1.5-.67,1.5-1.5s-.67-1.5-1.5-1.5-1.5.67-1.5,1.5.67,1.5,1.5,1.5Z" />
@@ -217,15 +200,14 @@ export default class DaSites extends LitElement {
 
   render() {
     return html`
-      <img src="/blocks/browse/da-sites/img/bg-gradient-org.avif" class="da-site-bg" alt="" />
       <div class="da-site-container">
         <div class="da-site-header">
           <h2>Recents</h2>
         </div>
-        ${this._recents && this._recents.length > 0 ? this.renderSites(this._recents) : this.renderEmpty()}
+        ${this._recents?.length > 0 ? this.renderSites(this._recents) : this.renderEmpty()}
         <div class="da-site-header">
           <h2>Sites</h2>
-          ${this._recents && this._recents.length > 0 ? this.renderGo() : nothing}
+          ${this._recents?.length > 0 ? this.renderGo() : nothing}
         </div>
         <div class="da-site-sandbox-new">
           <a class="da-double-card da-double-card-sandbox" href="#/aem-sandbox/block-collection">

@@ -42,7 +42,7 @@ class DaSheetPreview extends LitElement {
 
   getUrl(value) {
     if (value.startsWith('http')) return value;
-    return `https://main--${this.details.repo}--${this.details.owner}.aem.page${value}`;
+    return `https://main--${this.details.repo}--${this.details.owner}.ent-aem.page${value}`;
   }
 
   renderValue(value) {

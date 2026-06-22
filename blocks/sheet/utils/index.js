@@ -1,9 +1,8 @@
-import { daFetch } from '../../shared/utils.js';
-import { getNx } from '../../../scripts/utils.js';
-import { debouncedSaveSheets } from './utils.js';
+import { getNx, getNx2Api, nxJS } from '../../../scripts/utils.js';
+import { handleSave, staleCheck } from './utils.js';
 import '../da-sheet-tabs.js';
 
-const { loadStyle } = await import(`${getNx()}/scripts/nexter.js`);
+const { loadStyle } = await import(`${getNx()}${nxJS}`);
 const loadScript = (await import(`${getNx()}/utils/script.js`)).default;
 
 const SHEET_TEMPLATE = { minDimensions: [20, 20], sheetName: 'data' };
@@ -16,7 +15,7 @@ function resetSheets(el) {
   if (!el.jexcel) return;
   delete el.jexcel;
   el.innerHTML = '';
-  el.className = '';
+  el.classList.remove('jexcel_tabs');
 }
 
 function finishSetup(el, data) {
@@ -24,11 +23,9 @@ function finishSetup(el, data) {
   el.jexcel.forEach((sheet, idx) => {
     sheet.name = data[idx].sheetName;
     sheet.options.onbeforepaste = (_el, pasteVal) => pasteVal?.trim();
-    if (el.details.view !== 'config') {
-      sheet.options.onafterchanges = () => {
-        debouncedSaveSheets(el.jexcel);
-      };
-    }
+    sheet.options.onafterchanges = () => {
+      handleSave(el.jexcel, el.details.view);
+    };
   });
 
   // Setup tabs
@@ -87,7 +84,20 @@ export function getPermissions() {
 }
 
 export async function getData(url) {
-  const resp = await daFetch(url);
+  const { config, source, versions } = await getNx2Api();
+  const { pathname } = new URL(url);
+
+  const [api, org, site, ...parts] = pathname.slice(1).split('/');
+  let getFn = source.get;
+  if (api === 'config') getFn = config.get;
+
+  let resp;
+  if (api === 'versionsource') {
+    getFn = versions.get;
+    resp = await getFn({ org, site, versionId: parts.join('/') });
+  } else {
+    resp = await getFn({ org, site, path: parts.join('/') });
+  }
 
   // Set permissions even if the file is a 404
   const daTitle = document.querySelector('da-title');
@@ -103,10 +113,10 @@ export async function getData(url) {
   // Get base data
   const json = await resp.json();
 
-  const sheetPanes = document.querySelector('da-sheet-panes');
-  if (sheetPanes && !url.includes('/versionsource')) {
-    // Set AEM-formatted JSON for real-time preview
-    sheetPanes.data = json;
+  if (!url.includes('/versionsource')) {
+    staleCheck.markSynced(json);
+    const sheetPanes = document.querySelector('da-sheet-panes');
+    if (sheetPanes) sheetPanes.data = json;
   }
 
   // Single sheet

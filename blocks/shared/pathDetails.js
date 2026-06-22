@@ -1,4 +1,5 @@
 import { CON_ORIGIN, DA_ORIGIN } from './constants.js';
+import { sanitizePathParts } from '../../scripts/utils.js';
 
 let currpath;
 let currhash;
@@ -16,11 +17,13 @@ function getOrgDetails({ editor, pathParts, ext }) {
   const parentName = ext === null ? pathParts[0] : 'Root';
   const name = editor === 'config' && ext === null ? 'config' : pathParts[0];
   const daApi = editor === 'config' ? 'config' : 'source';
-  let path = ext === 'html' && !fullPath.endsWith('html') ? `${fullPath}.html` : fullPath;
+  let path = ext === 'html' && !fullPath.endsWith('.html') ? `${fullPath}.html` : fullPath;
   if (editor === 'sheet' && !path.endsWith('.json')) path = `${path}.${ext}`;
+  const org = pathParts[0];
 
   return {
-    owner: pathParts[0],
+    org,
+    owner: org,
     name,
     parent,
     parentName,
@@ -36,17 +39,19 @@ function getRepoDetails({ editor, pathParts, ext }) {
   const parentName = ext === null ? repo : org;
   const name = editor === 'config' ? `${repo} config` : repo;
   const daApi = editor === 'config' ? 'config' : 'source';
-  let path = ext === 'html' && !fullPath.endsWith('html') ? `${fullPath}.html` : fullPath;
+  let path = ext === 'html' && !fullPath.endsWith('.html') ? `${fullPath}.html` : fullPath;
   if (editor === 'sheet' && !path.endsWith('.json')) path = `${path}.${ext}`;
 
   return {
+    org,
+    site: repo,
     owner: org,
     repo,
     name,
     parent,
     parentName,
     sourceUrl: `${DA_ORIGIN}/${daApi}/${path}`,
-    previewUrl: `https://main--${repo}--${org}.aem.live`,
+    previewUrl: `https://main--${repo}--${org}.ent-aem.live`,
     contentUrl: `${CON_ORIGIN}/${fullPath}`,
   };
 }
@@ -66,16 +71,19 @@ function getFullDetails({ editor, pathParts, ext }) {
   const parentName = pathParts.pop();
 
   const daApi = editor === 'config' ? 'config' : 'source';
-  const path = ext === 'html' && !fullPath.endsWith('html') && editor !== 'sheet' ? `${fullPath}.html` : fullPath;
+  const path = ext === 'html' && !fullPath.endsWith('.html') && editor !== 'sheet' ? `${fullPath}.html` : fullPath;
 
   return {
-    owner: org,
-    repo,
+    org,
+    site: repo,
+    owner: org, // Backwards compatibility
+    repo, // Backwards compatibility
+    path: pathname,
     name: ext === null ? 'config' : name,
     parent: ext === null ? `${parent}/${name}` : parent,
     parentName: ext === null ? name : parentName,
     sourceUrl: `${DA_ORIGIN}/${daApi}/${path}`,
-    previewUrl: `https://main--${repo}--${org}.aem.live${pathname}`,
+    previewUrl: `https://main--${repo}--${org}.ent-aem.live${pathname}`,
     contentUrl: `${CON_ORIGIN}/${fullPath}`,
   };
 }
@@ -109,22 +117,35 @@ export default function getPathDetails(loc) {
   if (currhash === hash && currpath === pathname && details) return details;
   currhash = hash;
 
-  const fullpath = hash.replace('#', '');
+  let fullpath = hash.replace('#', '');
   window.name = fullpath;
 
   // config, edit, sheet
   const editor = getView(pathname);
 
-  // IMS will redirect and there's a small window where old_hash exists
-  if (!fullpath || fullpath.startsWith('old_hash') || fullpath.startsWith('access_token')) return null;
+  // IMS redirect fragments appear as '/ld_hash=', '/old_hash=', '/access_token=' in the path.
+  // fullpath always starts with '/' here, so strip it before the prefix check.
+  const pathContent = fullpath.slice(1);
+  if (!pathContent || pathContent.startsWith('old_hash') || pathContent.startsWith('access_token') || pathContent.startsWith('ld_hash')) return null;
 
   // Split everything up so it can be later used for both DA & AEM
-  const pathParts = fullpath.slice(1).toLowerCase().split('/');
+  const pathParts = sanitizePathParts(fullpath);
 
-  // Redirect JSON files from edit view to sheet view
-  if (editor === 'edit' && fullpath.endsWith('.json')) {
-    window.location.href = `/sheet#${fullpath.slice(0, -5)}`;
-    return null;
+  if (editor === 'edit') {
+    // Redirect JSON files from edit view to sheet view
+    if (fullpath.endsWith('.json')) {
+      window.location.href = `/sheet#${fullpath.slice(0, -5)}`;
+      return null;
+    }
+
+    if (fullpath.endsWith('/')) {
+      // Remove trailing slash from pathParts and fullpath
+      pathParts.pop();
+      fullpath = fullpath.slice(0, -1);
+      if (!loc) {
+        history.replaceState(null, '', `${window.location.pathname}${window.location.search}#${fullpath}`);
+      }
+    }
   }
 
   // Determine if folder (trailing slash split to empty string)
@@ -138,6 +159,7 @@ export default function getPathDetails(loc) {
   const ext = getExtension(editor, pathParts.slice(-1)[0], isFolder);
 
   const depth = pathParts.length;
+  const cleanParts = [...pathParts];
 
   if (depth === 1) details = getOrgDetails({ editor, pathParts, ext });
 
@@ -145,8 +167,10 @@ export default function getPathDetails(loc) {
 
   if (depth >= 3) details = getFullDetails({ editor, pathParts, ext });
 
-  let path = ext === 'html' && !fullpath.endsWith('html') ? `${fullpath}.html` : fullpath;
+  const cleanPath = `/${cleanParts.join('/')}`;
+  let path = ext === 'html' && !cleanPath.endsWith('.html') && editor !== 'sheet' ? `${cleanPath}.html` : cleanPath;
   if (editor === 'sheet' && !path.endsWith('.json')) path = `${path}.${ext}`;
+  if (isFolder && !path.endsWith('/')) path = `${path}/`;
 
   details = { ...details, origin: DA_ORIGIN, fullpath: path, depth, view: editor };
 

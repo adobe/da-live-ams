@@ -4,7 +4,7 @@ import {
   Slice,
 } from 'da-y-wrapper';
 import getSheet from '../../../shared/sheet.js';
-import { createElement } from '../../utils/helpers.js';
+import { createElement, getDiffLabels } from '../../utils/helpers.js';
 
 let overlayUIModule = null;
 async function loadOverlayUI() {
@@ -69,6 +69,15 @@ function simpleFilterContent(content) {
 
 const activeViews = new Set();
 
+function setDiffLabelCssVars(daEditor) {
+  if (!daEditor?.shadowRoot) return;
+
+  const labels = getDiffLabels();
+  const host = daEditor.shadowRoot.host || daEditor;
+  host.style.setProperty('--diff-label-local', `'${labels.local}'`);
+  host.style.setProperty('--diff-label-upstream', `'${labels.upstream}'`);
+}
+
 let locCssLoading = false;
 async function loadLocCss() {
   if (locCssLoading) return;
@@ -83,6 +92,9 @@ async function loadLocCss() {
     if (daEditor?.shadowRoot) {
       const existingSheets = daEditor.shadowRoot.adoptedStyleSheets || [];
       daEditor.shadowRoot.adoptedStyleSheets = [...existingSheets, locSheet];
+
+      // Set CSS custom properties for diff labels
+      setDiffLabelCssVars(daEditor);
     }
   } catch (error) {
     // eslint-disable-next-line no-console
@@ -457,6 +469,9 @@ export function getDiffClass(elName, getSchema, dispatchTransaction, { isUpstrea
       try {
         const { overlay, deleteBtn, keepBtn } = await getLangOverlay(upstream);
 
+        // Bail out if destroy() detached the placeholder before this resolved.
+        if (this.langOverlay?.parentNode !== coverDiv) return;
+
         deleteBtn.addEventListener('click', () => {
           this.handleDeleteSingleNode();
         });
@@ -518,13 +533,16 @@ export function getDiffClass(elName, getSchema, dispatchTransaction, { isUpstrea
       ];
     }
 
-    get pairNodeParams() {
-      return [
-        ...this.baseParams,
-        this.canFormLocPair.bind(this),
+    get pairNodeContext() {
+      return {
+        view: this.view,
+        getPos: this.getPos.bind(this),
+        isValidPosition,
+        isLocNode,
+        canFormLocPair: this.canFormLocPair.bind(this),
         filterNodeContent,
-        this.dispatchContentTransaction.bind(this),
-      ];
+        dispatchContentTransaction: this.dispatchContentTransaction.bind(this),
+      };
     }
 
     async handleDeleteSingleNode() {
@@ -536,15 +554,15 @@ export function getDiffClass(elName, getSchema, dispatchTransaction, { isUpstrea
     }
 
     async handleKeepDeleted() {
-      await this.callUserAction('handleKeepDeleted', this.pairNodeParams, 'keep deleted');
+      await this.callUserAction('handleKeepDeleted', [this.pairNodeContext], 'keep deleted');
     }
 
     async handleKeepAdded() {
-      await this.callUserAction('handleKeepAdded', this.pairNodeParams, 'keep added');
+      await this.callUserAction('handleKeepAdded', [this.pairNodeContext], 'keep added');
     }
 
     async handleKeepBoth() {
-      await this.callUserAction('handleKeepBoth', this.pairNodeParams, 'keep both');
+      await this.callUserAction('handleKeepBoth', [this.pairNodeContext], 'keep both');
     }
 
     destroy() {

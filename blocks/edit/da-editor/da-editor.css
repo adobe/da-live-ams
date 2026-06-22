@@ -8,6 +8,7 @@
   --editor-btn-bg-color: #EFEFEF;
   --editor-btn-bg-color-hover: var(--s2-blue-900);
 
+  position: relative;
   grid-area: editor;
 }
 
@@ -19,16 +20,35 @@
 
 .da-version-action-area {
   display: flex;
-  justify-content: end;
+  align-items: center;
+  justify-content: space-between;
   gap: 12px;
   position: absolute;
   top: 0;
-  z-index: 2;
+  z-index: 5;
   width: 100%;
   padding: 20px;
   background: #EFEFEF;
   box-sizing: border-box;
   border-radius: 10px 10px 0 0;
+}
+
+.da-version-title {
+  margin: 0;
+  font-family: var(--body-font-family);
+  font-size: 18px;
+  font-weight: 700;
+  color: #000;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.da-version-action-buttons {
+  display: flex;
+  gap: 12px;
+  flex: 0 0 auto;
 }
 
 .da-version-action-area button {
@@ -893,7 +913,7 @@ da-diff-deleted, da-diff-added {
 }
 
 .diff-color-overlay.diff-upstream::after {
-  content: 'Upstream';
+  content: var(--diff-label-upstream, 'Upstream');
   position: absolute;
   bottom: 4px;
   right: 4px;
@@ -909,7 +929,7 @@ da-diff-deleted, da-diff-added {
 }
 
 .diff-color-overlay.diff-local::after {
-  content: 'Local';
+  content: var(--diff-label-local, 'Local');
   position: absolute;
   bottom: 4px;
   right: 4px;
@@ -924,4 +944,86 @@ da-diff-deleted, da-diff-added {
   text-align: center;
 }
 
+/* Wrapper for images with focal point overlay */
+.focal-point-image-wrapper {
+  position: relative;
+  display: block;
+}
 
+.focal-point-image-wrapper img {
+  display: block;
+  position: relative;
+}
+
+/* Focal point icon overlay on images in tables */
+.focal-point-icon {
+  position: absolute;
+  bottom: 4px;
+  left: 4px;
+  width: 32px;
+  height: 32px;
+  background: rgb(255 255 255 / 90%);
+  border: 1px solid #ccc;
+  border-radius: 4px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.2s ease;
+  z-index: 10;
+  pointer-events: auto;
+}
+
+/* Show icon on hover ONLY for images without focal point data */
+.focal-point-image-wrapper:hover .focal-point-icon:not(.focal-point-icon-active) {
+  opacity: 1;
+}
+
+/* Always show icon for images with focal point data */
+.focal-point-icon-active {
+  opacity: 1;
+}
+
+.focal-point-icon:hover {
+  background: #fff;
+  border-color: #0265dc;
+}
+
+.focal-point-icon svg {
+  color: #505050;
+}
+
+.focal-point-icon svg .fill {
+  fill: currentcolor;
+}
+
+.focal-point-icon:hover svg {
+  color: #0265dc;
+}
+
+.table-select-handle {
+  position: absolute;
+  width: 20px;
+  height: 20px;
+  background-color: #fff;
+  background-image: url('/blocks/edit/img/select-handle.svg');
+  background-repeat: no-repeat;
+  background-position: center;
+  border: 1px solid #ccc;
+  border-radius: 4px;
+  z-index: 1;
+  cursor: pointer;
+  display: none;
+  align-items: center;
+  justify-content: center;
+}
+
+.table-select-handle.is-visible {
+  display: flex;
+}
+
+.table-select-handle:hover {
+  background-color: #f0f7ff;
+  border-color: var(--s2-blue-800);
+}

@@ -1,7 +1,6 @@
 import { LitElement, html, nothing } from 'da-lit';
-import { DA_ORIGIN } from '../../shared/constants.js';
-import { daFetch, getFirstSheet } from '../../shared/utils.js';
-import { getNx } from '../../../scripts/utils.js';
+import { getFirstSheet } from '../../shared/utils.js';
+import { getNx, getNx2Api, sanitizePathParts } from '../../../scripts/utils.js';
 
 // Components
 import '../da-breadcrumbs/da-breadcrumbs.js';
@@ -9,9 +8,9 @@ import '../da-new/da-new.js';
 import '../da-search/da-search.js';
 import '../da-list/da-list.js';
 
-// Styles
-const { default: getStyle } = await import(`${getNx()}/utils/styles.js`);
-const STYLE = await getStyle(import.meta.url);
+const { loadStyle } = await import(`${getNx()}/utils/utils.js`);
+
+const style = await loadStyle(import.meta.url);
 
 export default class DaBrowse extends LitElement {
   static properties = {
@@ -38,7 +37,7 @@ export default class DaBrowse extends LitElement {
 
   connectedCallback() {
     super.connectedCallback();
-    this.shadowRoot.adoptedStyleSheets = [STYLE];
+    this.shadowRoot.adoptedStyleSheets = [style];
     document.addEventListener('keydown', this.handleShortcuts.bind(this));
   }
 
@@ -52,7 +51,7 @@ export default class DaBrowse extends LitElement {
     if ((e.metaKey || e.ctrlKey) && e.altKey && e.code === 'KeyT') {
       e.preventDefault();
       const { fullpath } = this.details;
-      const [, ...split] = fullpath.split('/');
+      const [...split] = sanitizePathParts(fullpath);
       if (split.length < 2) return;
 
       if (split[2] === '.trash') {
@@ -72,7 +71,7 @@ export default class DaBrowse extends LitElement {
   async update(props) {
     if (props.has('details') && this.details) {
       // Only re-fetch if the orgs are different
-      const reFetch = props.get('details')?.owner !== this.details.owner;
+      const reFetch = props.get('details')?.org !== this.details.org;
       this.editor = await this.getEditor(reFetch);
     }
 
@@ -83,7 +82,8 @@ export default class DaBrowse extends LitElement {
     const DEF_EDIT = '/edit#';
 
     if (reFetch) {
-      const resp = await daFetch(`${DA_ORIGIN}/config/${this.details.owner}/`);
+      const { config } = await getNx2Api();
+      const resp = await config.get({ org: this.details.org });
       if (!resp.ok) return DEF_EDIT;
       const json = await resp.json();
 
@@ -104,7 +104,7 @@ export default class DaBrowse extends LitElement {
     if (matchedConfs.length === 0) return DEF_EDIT;
 
     // Sort by length in descending order (longest first)
-    const matchedConf = matchedConfs.sort((a, b) => b.length - a.length)[0];
+    const matchedConf = matchedConfs.sort((a, b) => b.split('=')[0].length - a.split('=')[0].length)[0];
 
     return matchedConf.split('=')[1];
   }
@@ -129,6 +129,15 @@ export default class DaBrowse extends LitElement {
     return this.shadowRoot.querySelector('da-new');
   }
 
+  get browseListItems() {
+    // eslint-disable-next-line no-underscore-dangle
+    return this.shadowRoot.querySelector('.da-list-type-browse')?._listItems || [];
+  }
+
+  isRootFolder(path) {
+    return path.split('/').length <= 2;
+  }
+
   renderNew() {
     return html`
       <da-new
@@ -139,7 +148,12 @@ export default class DaBrowse extends LitElement {
   }
 
   renderSearch() {
-    return html`<da-search @updated=${this.handleSearch} fullpath="${this.details.fullpath}"></da-search>`;
+    return html`
+      <da-search
+        @updated=${this.handleSearch}
+        fullpath="${this.details.fullpath}"
+        .browseItems="${this.browseListItems}">
+      </da-search>`;
   }
 
   renderList(type, fullpath, select, sort, drag) {
@@ -157,19 +171,24 @@ export default class DaBrowse extends LitElement {
   render() {
     return html`
       <div class="da-tablist" role="tablist" aria-label="Dark Alley content">
-        ${this._tabItems.map((tab, idx) => html`
-          <button
-            id="tab-${tab.id}"
-            type="button"
-            role="tab"
-            aria-selected="${tab.selected}"
-            aria-controls="tabpanel-${tab.id}"
-            @click=${() => { this.handleTabClick(idx); }}>
-            <span class="focus">${tab.title}</span>
-          </button>`)}
+        ${this._tabItems.map((tab, idx) => {
+          if (tab.id === 'search' && this.isRootFolder(this.details.fullpath)) {
+            return nothing;
+          }
+          return html`
+            <button
+              id="tab-${tab.id}"
+              type="button"
+              role="tab"
+              aria-selected="${tab.selected}"
+              aria-controls="tabpanel-${tab.id}"
+              @click=${() => { this.handleTabClick(idx); }}>
+              <span class="focus">${tab.title}</span>
+            </button>`;
+        })}
       </div>
       <div class="da-list-header context-${this.context}">
-        <da-breadcrumbs fullpath="${this.details.fullpath}" depth="${this.details.depth}"></da-breadcrumbs>
+        <da-breadcrumbs .details="${this.details}"></da-breadcrumbs>
         ${this._tabItems.map((tab) => html`
           <div class="da-list-header-action" data-visible="${tab.selected}">
             ${tab.id === 'browse' ? this.renderNew() : this.renderSearch()}
@@ -177,7 +196,7 @@ export default class DaBrowse extends LitElement {
         `)}
       </div>
       ${this._tabItems.map((tab) => html`
-        <div class="da-tabpanel" id="tabpanel-${tab.id}" role="tabpanel" aria-labelledby="tab-${tab.id}" data-visible="${tab.selected}">
+        <div class="da-tabpanel" id="tabpanel-${tab.id}" role="grid" aria-labelledby="tab-${tab.id}" data-visible="${tab.selected}">
           ${tab.id === 'browse' ? this.renderList(tab.id, this.details.fullpath, true, true, true) : this.renderList(tab.id, null, false, false, false)}
         </div>
       `)}

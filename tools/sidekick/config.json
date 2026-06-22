@@ -1,6 +1,6 @@
 {
   "project": "DA Live",
-  "host": "stg.ssa-da.live",
+  "host": "ent-da.live",
   "plugins": [
     {
       "id": "da-tags",

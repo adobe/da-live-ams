@@ -12,50 +12,176 @@ import {
   sinkListItem,
   gapCursor,
   TextSelection,
-  Y,
+  NodeSelection,
+  Plugin,
+  PluginKey,
   WebsocketProvider,
   ySyncPlugin,
   yCursorPlugin,
   yUndoPlugin,
+  Y,
 } from 'da-y-wrapper';
 
-// DA
-import prose2aem from '../../shared/prose2aem.js';
-import menu, { getHeadingKeymap } from './plugins/menu/menu.js';
-import { linkItem } from './plugins/menu/linkItem.js';
-import codemark from './plugins/codemark.js';
-import imageDrop from './plugins/imageDrop.js';
-import linkConverter from './plugins/linkConverter.js';
-import sectionPasteHandler from './plugins/sectionPasteHandler.js';
-import base64Uploader from './plugins/base64uploader.js';
+import { getSchema } from 'da-parser';
 import { COLLAB_ORIGIN, DA_ORIGIN } from '../../shared/constants.js';
-import toggleLibrary from '../da-library/da-library.js';
-import { debounce } from '../utils/helpers.js';
+import { daFetch, getAuthToken } from '../../shared/utils.js';
 import { getDiffClass, checkForLocNodes, addActiveView } from './diff/diff-utils.js';
-import { getSchema } from './schema.js';
-import slashMenu from './plugins/slashMenu/slashMenu.js';
-import {
-  handleTableBackspace,
-  handleTableTab,
-  getEnterInputRulesPlugin,
-  getURLInputRulesPlugin,
-  handleUndo,
-  handleRedo,
-} from './plugins/keyHandlers.js';
+import { debounce, initDaMetadata } from '../utils/helpers.js';
+import { forceSave } from './forcesave.js';
 
-let sendUpdates = false;
-let hasChanged = 0;
+// Rapid-reconnect guard (COR-44): y-websocket resets its backoff counter on
+// every successful onopen, so a close that follows a brief successful
+// handshake reschedules at 100ms. Single users behind corporate proxies can
+// sustain thousands of WS upgrades/sec/IP through this path. The guard below
+// detects open-then-close cycles shorter than MIN_HEALTHY_SESSION_MS and
+// applies a manual exponential backoff before letting the provider reconnect.
+const MIN_HEALTHY_SESSION_MS = 5000;
+const SHORT_SESSION_BASE_MS = 1000;
+const SHORT_SESSION_MAX_MS = 30000;
+
+async function checkDoc(path) {
+  return daFetch(path, { method: 'HEAD' });
+}
+
+export async function createConnection(path) {
+  const ydoc = new Y.Doc();
+
+  const server = COLLAB_ORIGIN;
+  const roomName = `${DA_ORIGIN}${new URL(path).pathname}`;
+
+  const opts = {
+    protocols: ['yjs'],
+    connect: true,
+  };
+
+  const token = await getAuthToken();
+  if (token) {
+    opts.protocols.push(token);
+  }
+
+  const provider = new WebsocketProvider(server, roomName, ydoc, opts);
+  // Increase the max backoff time to 30 seconds. If connection error occurs,
+  // the socket provider will try to reconnect quickly at the beginning
+  // (exponential backoff starting with 100ms) and then every 30s.
+  provider.maxBackoffTime = 30000;
+
+  let lastSentToken = token || null;
+  let lastOpenAt = 0;
+  let failedShortSessions = 0;
+
+  provider.on('status', (st) => {
+    if (st?.status === 'connected') lastOpenAt = Date.now();
+  });
+
+  provider.on('connection-close', async (event) => {
+    if (event?.code === 4401 || event?.code === 4403) {
+      provider.shouldConnect = false;
+      // Force imslib to attempt a refresh before deciding to give up.
+      try { await window.adobeIMS?.refreshToken?.(); } catch { /* ignore */ }
+      const fresh = await getAuthToken();
+      if (!fresh || fresh === lastSentToken) {
+        // No new token to try — retrying would loop on the same 4401. Stop
+        // the reconnect loop, and surface the modal if the user was signed in.
+        if (lastSentToken) {
+          try {
+            const { showAuthBanner } = await import('../../shared/da-auth-banner/da-auth-banner.js');
+            showAuthBanner();
+          } catch { /* ignore */ }
+        }
+        return;
+      }
+      provider.protocols = ['yjs', fresh];
+      lastSentToken = fresh;
+      provider.connect();
+      return;
+    }
+
+    // Non-auth close: rapid-reconnect guard. y-websocket's own 100ms
+    // setTimeout(setupWS) still fires from onclose, but provider.disconnect()
+    // flips shouldConnect=false so that timer's setupWS call no-ops. The
+    // manual setTimeout below is what re-arms the connection.
+    const sessionMs = lastOpenAt ? Date.now() - lastOpenAt : 0;
+    lastOpenAt = 0;
+    if (sessionMs >= MIN_HEALTHY_SESSION_MS) {
+      failedShortSessions = 0;
+    } else {
+      const delay = Math.min(
+        2 ** failedShortSessions * SHORT_SESSION_BASE_MS,
+        SHORT_SESSION_MAX_MS,
+      );
+      failedShortSessions += 1;
+      provider.shouldConnect = false;
+      provider.disconnect();
+      setTimeout(() => {
+        provider.shouldConnect = true;
+        provider.connect();
+      }, delay);
+    }
+
+    const fresh = await getAuthToken();
+    provider.protocols = fresh ? ['yjs', fresh] : ['yjs'];
+    lastSentToken = fresh;
+  });
+
+  return { wsProvider: provider, ydoc };
+}
+
+async function loadCustomPlugins() {
+  const [
+    keyHandlers,
+    { default: menu, getHeadingKeymap },
+    { linkItem },
+    { default: codemark },
+    { default: imageDrop },
+    { default: imageFocalPoint },
+    { default: tableSelectHandle },
+    { default: linkConverter },
+    { default: linkTextSync },
+    { default: sectionPasteHandler },
+    { default: base64Uploader },
+    { default: toggleLibrary },
+    { default: slashMenu },
+    { default: linkMenu },
+  ] = await Promise.all([
+    import('./plugins/keyHandlers.js'),
+    import('./plugins/menu/menu.js'),
+    import('./plugins/menu/linkItem.js'),
+    import('./plugins/codemark.js'),
+    import('./plugins/imageDrop.js'),
+    import('./plugins/imageFocalPoint.js'),
+    import('./plugins/tableSelectHandle.js'),
+    import('./plugins/linkConverter.js'),
+    import('./plugins/linkTextSync.js'),
+    import('./plugins/sectionPasteHandler.js'),
+    import('./plugins/base64uploader.js'),
+    import('../da-library/da-library.js'),
+    import('./plugins/slashMenu/slashMenu.js'),
+    import('./plugins/linkMenu/linkMenu.js'),
+  ]);
+
+  return {
+    ...keyHandlers,
+    menu,
+    getHeadingKeymap,
+    linkItem,
+    codemark,
+    imageDrop,
+    imageFocalPoint,
+    tableSelectHandle,
+    linkConverter,
+    linkTextSync,
+    sectionPasteHandler,
+    base64Uploader,
+    toggleLibrary,
+    slashMenu,
+    linkMenu,
+  };
+}
+
 let lastCursorPosition = null;
-let daPreview;
-let updatePoller;
 
 function dispatchTransaction(transaction) {
   if (!window.view) return;
-
-  if (transaction.docChanged) {
-    hasChanged += 1;
-    sendUpdates = true;
-  }
 
   const newState = window.view.state.apply(transaction);
   window.view.updateState(newState);
@@ -66,49 +192,106 @@ function dispatchTransaction(transaction) {
 }
 
 function setPreviewBody() {
-  daPreview ??= document.querySelector('da-content')?.shadowRoot.querySelector('da-preview');
+  const daPreview = document.querySelector('da-content').shadowRoot.querySelector('da-preview');
   if (!daPreview) return;
-
-  const clone = window.view.docView.dom.cloneNode(true);
-  const body = prose2aem(clone, true);
-  daPreview.body = body;
+  daPreview.setBody();
 }
 
-export function pollForUpdates() {
-  if (updatePoller) clearInterval(updatePoller);
+function trackCursorAndChanges() {
+  let lastCursorPos = null;
+  let lastBlockPos = null;
+  let updateTimeout = null;
+  let pendingDocChange = false;
 
-  updatePoller = setInterval(() => {
-    if (sendUpdates) {
-      if (hasChanged > 0) {
-        hasChanged = 0;
-        return;
-      }
+  const schedulePreviewUpdate = () => {
+    if (updateTimeout) clearTimeout(updateTimeout);
+
+    updateTimeout = setTimeout(() => {
       setPreviewBody();
-      sendUpdates = false;
+      pendingDocChange = false;
+      updateTimeout = null;
+    }, 500);
+  };
+
+  const getBlockPosition = (state, pos) => {
+    // Resolve the position to get context about where it is in the document
+    const $pos = state.doc.resolve(pos);
+
+    // Find the depth of the nearest block-level node
+    // Start from the deepest position and walk up to find a block
+    for (let d = $pos.depth; d > 0; d -= 1) {
+      const node = $pos.node(d);
+      if (node.isBlock) {
+        // Return the position before this block node
+        return $pos.before(d);
+      }
     }
-  }, 500);
+
+    // Fallback to the position itself
+    return pos;
+  };
+
+  const trackCursorKey = new PluginKey('trackCursor');
+
+  return new Plugin({
+    key: trackCursorKey,
+    view() {
+      return {
+        update(view, prevState) {
+          const docChanged = view.state.doc !== prevState.doc;
+
+          if (docChanged) {
+            // Document changed - schedule update after 500ms of no changes
+            pendingDocChange = true;
+            schedulePreviewUpdate();
+            return;
+          }
+
+          // Only track cursor if no pending document changes
+          if (pendingDocChange) return;
+
+          const { from, to } = view.state.selection;
+          const isNodeSelection = view.state.selection instanceof NodeSelection;
+
+          // Don't update during text selection (when from !== to),
+          // but allow node selections (like images)
+          if (from !== to && !isNodeSelection) return;
+
+          const currentPos = `${from}-${to}`;
+          const currentBlockPos = getBlockPosition(view.state, from);
+
+          // Only update if cursor position actually changed
+          if (currentPos !== lastCursorPos) {
+            // Only set preview body if:
+            // 1. We had a lastCursorPos (not the first position)
+            // 2. AND the block changed (moved to a different block/row)
+            if (lastCursorPos && currentBlockPos !== lastBlockPos) {
+              setPreviewBody();
+            }
+            lastCursorPos = currentPos;
+            lastBlockPos = currentBlockPos;
+          }
+        },
+      };
+    },
+  });
 }
 
-function handleProseLoaded(editor) {
-  // Give the websocket time to connect and populate
-  setTimeout(() => {
-    const daEditor = editor.getRootNode().host;
-    const opts = { bubbles: true, composed: true };
-    const event = new CustomEvent('proseloaded', opts);
-    daEditor.dispatchEvent(event);
-  }, 3000);
+function onWsSync(wsProvider, callback) {
+  if (wsProvider.synced) {
+    setTimeout(callback, 0);
+    return;
+  }
+  const handleSynced = (isSynced) => {
+    if (isSynced) {
+      setTimeout(callback, 0);
+      wsProvider.off('synced', handleSynced);
+    }
+  };
+  wsProvider.on('synced', handleSynced);
 }
 
-function startPreviewing() {
-  setPreviewBody();
-  pollForUpdates();
-}
-
-function stopPreviewing() {
-  if (updatePoller) clearInterval(updatePoller);
-}
-
-function handleAwarenessUpdates(wsProvider, daTitle, win) {
+function handleAwarenessUpdates(wsProvider, daTitle, win, path) {
   const users = new Set();
 
   wsProvider.awareness.on('update', (delta) => {
@@ -121,25 +304,57 @@ function handleAwarenessUpdates(wsProvider, daTitle, win) {
 
     const awarenessStates = wsProvider.awareness.getStates();
     const userMap = new Map();
-    [...users].forEach((u) => {
+    [...users].forEach((u, i) => {
       const userInfo = awarenessStates.get(u)?.user;
       if (!userInfo?.id) {
         userMap.set(`anonymous-${u}`, 'Anonymous');
-      } else if (userInfo.id !== wsProvider.awareness.getLocalState().user?.id) {
-        userMap.set(userInfo.id, userInfo.name);
+      } else {
+        userMap.set(`${userInfo.id}-${i}`, userInfo.name);
       }
     });
     daTitle.collabUsers = [...userMap.values()].sort();
   });
 
   wsProvider.on('status', (st) => { daTitle.collabStatus = st.status; });
+
+  // Seed from current provider state in case 'status' fired before subscribe.
+  if (wsProvider.wsconnected) daTitle.collabStatus = 'connected';
+  else daTitle.collabStatus = 'connecting';
+
+  wsProvider.on('connection-close', async (event) => {
+    if (event?.code === 4401 || event?.code === 4403) return;
+    const resp = await checkDoc(path);
+    if (resp.status === 404) {
+      const { hash } = window.location;
+      // Guard: hash must start with '#/' — during an IMS redirect the hash is '#access_token=...'
+      // and slice(2) would remove '#a', writing 'ccess_token=...' into the URL as an org name.
+      if (!hash.startsWith('#/')) return;
+      const split = hash.slice(2).split('/');
+      split.pop();
+      // Navigate to the parent folder
+      window.location.replace(`/#/${split.join('/')}`);
+    }
+  });
   win.addEventListener('online', () => { daTitle.collabStatus = 'online'; });
   win.addEventListener('offline', () => { daTitle.collabStatus = 'offline'; });
+  const DISCONNECT_TIMEOUT = 10 * 60 * 1000;
+  let disconnectTimeout = null;
+  win.addEventListener('focus', () => {
+    // cancel any pending disconnect
+    if (disconnectTimeout) clearTimeout(disconnectTimeout);
+    if (!wsProvider.wsconnected) wsProvider.connect();
+  });
+  win.addEventListener('blur', () => {
+    if (disconnectTimeout) clearTimeout(disconnectTimeout);
+    disconnectTimeout = setTimeout(() => {
+      wsProvider.disconnect();
+    }, DISCONNECT_TIMEOUT);
+  });
 }
 
-export function createAwarenessStatusWidget(wsProvider, win) {
+export function createAwarenessStatusWidget(wsProvider, win, path) {
   const daTitle = win.document.querySelector('da-title');
-  handleAwarenessUpdates(wsProvider, daTitle, win);
+  handleAwarenessUpdates(wsProvider, daTitle, win, path);
   return daTitle;
 }
 
@@ -147,8 +362,17 @@ function registerErrorHandler(ydoc) {
   ydoc.on('update', () => {
     const errorMap = ydoc.getMap('error');
     if (errorMap && errorMap.size > 0) {
-      // eslint-disable-next-line no-console
-      console.log('Error from server', JSON.stringify(errorMap));
+      const message = errorMap.get('message') || JSON.stringify(errorMap.toJSON());
+      if (message.startsWith('401')) {
+        // eslint-disable-next-line no-console
+        console.warn(`Message from collab: ${message}`);
+      } else if (message.startsWith('403 ')) {
+        // eslint-disable-next-line no-console
+        console.log(`Message from collab: ${message}`);
+      } else {
+        // eslint-disable-next-line no-console
+        console.error(`Error message from collab: ${message}`, errorMap.toJSON());
+      }
       errorMap.clear();
     }
   });
@@ -193,116 +417,129 @@ function restoreCursorPosition(view) {
 }
 
 function addSyncedListener(wsProvider, canWrite) {
-  const handleSynced = (isSynced) => {
-    if (isSynced) {
-      if (canWrite) {
-        const pm = document.querySelector('da-content')?.shadowRoot
-          .querySelector('da-editor')?.shadowRoot.querySelector('.ProseMirror');
-        if (pm) pm.contentEditable = 'true';
-      }
-      wsProvider.off('synced', handleSynced);
+  onWsSync(wsProvider, () => {
+    if (canWrite) {
+      const pm = document.querySelector('da-content')?.shadowRoot
+        .querySelector('da-editor')?.shadowRoot.querySelector('.ProseMirror');
+      if (pm) pm.contentEditable = 'true';
     }
-  };
-
-  wsProvider.on('synced', handleSynced);
+  });
 }
 
-export default function initProse({ path, permissions }) {
+function applyDelayedPlugins(pluginsPromise, schema, canWrite, basePlugins) {
+  pluginsPromise.then((plugins) => {
+    const {
+      syncPlugin,
+      cursorPlugin,
+    } = basePlugins;
+
+    const undoPlugin = yUndoPlugin();
+    const trackPlugin = trackCursorAndChanges();
+    const buildKeymapPlugin = keymap(buildKeymap(schema));
+    const baseKeymapPlugin = keymap(baseKeymap);
+    const gapCursorPlugin = gapCursor();
+    const tableEditingPlugin = tableEditing({ allowTableNodeSelection: true });
+
+    const pluginList = [
+      syncPlugin,
+      cursorPlugin,
+      undoPlugin,
+      trackPlugin,
+      plugins.slashMenu(),
+      plugins.linkMenu(),
+      plugins.tableSelectHandle(),
+      plugins.imageDrop(schema),
+      plugins.linkConverter(schema),
+      plugins.linkTextSync(),
+      plugins.sectionPasteHandler(schema),
+      plugins.base64Uploader(schema),
+      columnResizing(),
+      plugins.getEnterInputRulesPlugin(dispatchTransaction),
+      plugins.getURLInputRulesPlugin(),
+      plugins.getListInputRulesPlugin(schema),
+      buildKeymapPlugin,
+      keymap({ Backspace: plugins.handleTableBackspace }),
+      baseKeymapPlugin,
+      plugins.codemark(),
+      keymap({
+        'Mod-z': plugins.handleUndo,
+        'Mod-y': plugins.handleRedo,
+        'Mod-Shift-z': plugins.handleRedo,
+        'Mod-Shift-l': plugins.toggleLibrary,
+        'Mod-k': (editorState, dispatch, view) => {
+          const linkMarkType = editorState.schema.marks.link;
+          const linkMenuItem = plugins.linkItem(linkMarkType);
+          return linkMenuItem.spec.run(editorState, dispatch, view);
+        },
+        ...plugins.getHeadingKeymap(schema),
+      }),
+      keymap({
+        Tab: plugins.handleTableTab(1),
+        'Shift-Tab': plugins.handleTableTab(-1),
+      }),
+      keymap({
+        Tab: sinkListItem(schema.nodes.list_item),
+        'Shift-Tab': liftListItem(schema.nodes.list_item),
+      }),
+      gapCursorPlugin,
+      tableEditingPlugin,
+    ];
+
+    if (canWrite) {
+      pluginList.unshift(plugins.menu);
+      pluginList.push(plugins.imageFocalPoint());
+    }
+
+    // Reconfigure the view with the full plugin list
+    const newState = window.view.state.reconfigure({ plugins: pluginList });
+    window.view.updateState(newState);
+  });
+}
+
+// eslint-disable-next-line no-unused-vars
+export default async function initProse({ path, permissions, doc, daContent, wsPromise }) {
   // Destroy ProseMirror if it already exists - GH-212
-  if (window.view) delete window.view;
+  if (window.view) {
+    window.view.destroy();
+    delete window.view;
+  }
+
+  const connectionPromise = wsPromise || createConnection(path);
+
   const editor = document.createElement('div');
   editor.className = 'da-prose-mirror';
 
   const schema = getSchema();
-
-  const ydoc = new Y.Doc();
-
-  const server = COLLAB_ORIGIN;
-  const roomName = `${DA_ORIGIN}${new URL(path).pathname}`;
-
-  const opts = {};
-
-  if (window.adobeIMS?.isSignedInUser()) {
-    opts.params = { Authorization: `Bearer ${window.adobeIMS.getAccessToken().token}` };
-  }
-
   const canWrite = permissions.some((permission) => permission === 'write');
 
-  const wsProvider = new WebsocketProvider(server, roomName, ydoc, opts);
-  addSyncedListener(wsProvider, canWrite);
+  const { wsProvider, ydoc } = await connectionPromise;
 
-  createAwarenessStatusWidget(wsProvider, window);
+  addSyncedListener(wsProvider, canWrite);
+  createAwarenessStatusWidget(wsProvider, window, path);
   registerErrorHandler(ydoc);
 
   const yXmlFragment = ydoc.getXmlFragment('prosemirror');
 
   if (window.adobeIMS?.isSignedInUser()) {
-    window.adobeIMS.getProfile().then(
-      (profile) => {
-        wsProvider.awareness.setLocalStateField(
-          'user',
-          {
-            color: generateColor(profile.email || profile.userId),
-            name: profile.displayName,
-            id: profile.userId,
-          },
-        );
-      },
-    );
+    window.adobeIMS.getProfile().then((profile) => {
+      wsProvider.awareness.setLocalStateField('user', {
+        color: generateColor(profile.email || profile.userId),
+        name: profile.displayName,
+        id: profile.userId,
+      });
+    });
   } else {
-    wsProvider.awareness.setLocalStateField(
-      'user',
-      {
-        color: generateColor(`${wsProvider.awareness.clientID}`),
-        name: 'Anonymous',
-        id: `anonymous-${wsProvider.awareness.clientID}}`,
-      },
-    );
+    wsProvider.awareness.setLocalStateField('user', {
+      color: generateColor(`${wsProvider.awareness.clientID}`),
+      name: 'Anonymous',
+      id: `anonymous-${wsProvider.awareness.clientID}}`,
+    });
   }
 
-  const plugins = [
-    ySyncPlugin(yXmlFragment),
-    yCursorPlugin(wsProvider.awareness),
-    yUndoPlugin(),
-    slashMenu(),
-    imageDrop(schema),
-    linkConverter(schema),
-    sectionPasteHandler(schema),
-    base64Uploader(schema),
-    columnResizing(),
-    getEnterInputRulesPlugin(dispatchTransaction),
-    getURLInputRulesPlugin(),
-    keymap(buildKeymap(schema)),
-    keymap({ Backspace: handleTableBackspace }),
-    keymap(baseKeymap),
-    codemark(),
-    keymap({
-      'Mod-z': handleUndo,
-      'Mod-y': handleRedo,
-      'Mod-Shift-z': handleRedo,
-      'Mod-Shift-l': toggleLibrary,
-      'Mod-k': (state, dispatch, view) => { // toggle link prompt
-        const linkMarkType = state.schema.marks.link;
-        const linkMenuItem = linkItem(linkMarkType);
-        return linkMenuItem.spec.run(state, dispatch, view);
-      },
-      ...getHeadingKeymap(schema),
-    }),
-    keymap({
-      Tab: handleTableTab(1),
-      'Shift-Tab': handleTableTab(-1),
-    }),
-    keymap({
-      Tab: sinkListItem(schema.nodes.list_item),
-      'Shift-Tab': liftListItem(schema.nodes.list_item),
-    }),
-    gapCursor(),
-    tableEditing(),
-  ];
+  const syncPlugin = ySyncPlugin(yXmlFragment);
+  const cursorPlugin = yCursorPlugin(wsProvider.awareness);
 
-  if (canWrite) plugins.push(menu);
-
-  let state = EditorState.create({ schema, plugins });
+  let state = EditorState.create({ schema, plugins: [syncPlugin, cursorPlugin] });
 
   const fix = fixTables(state);
   if (fix) state = state.apply(fix.setMeta('addToHistory', false));
@@ -333,16 +570,21 @@ export default function initProse({ path, permissions }) {
     editable() { return canWrite; },
   });
 
-  // Register view for global dialog management
   addActiveView(window.view);
 
-  // Check for initial regional edits
-  setTimeout(() => checkForLocNodes(window.view), 100);
+  // yMap for storing document metadata (not synced to ProseMirror doc.attrs)
+  initDaMetadata(ydoc.getMap('daMetadata'));
 
-  handleProseLoaded(editor, permissions);
+  const pluginsPromise = loadCustomPlugins();
+  applyDelayedPlugins(pluginsPromise, schema, canWrite, {
+    syncPlugin,
+    cursorPlugin,
+  });
 
   document.execCommand('enableObjectResizing', false, 'false');
   document.execCommand('enableInlineTableEditing', false, 'false');
 
-  return { proseEl: editor, wsProvider, startPreviewing, stopPreviewing };
+  daContent.proseEl = editor;
+  daContent.wsProvider = wsProvider;
+  daContent.forceSave = () => forceSave(wsProvider);
 }

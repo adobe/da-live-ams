@@ -1,17 +1,33 @@
 import { LitElement, html, nothing } from 'da-lit';
-import { DA_ORIGIN } from '../../shared/constants.js';
-import { getNx } from '../../../scripts/utils.js';
-import { daFetch } from '../../shared/utils.js';
+import { getNx, getNx2Api } from '../../../scripts/utils.js';
 
 const { crawl, Queue } = await import(`${getNx()}/public/utils/tree.js`);
 
 // Styles
-const { default: getStyle } = await import(`${getNx()}/utils/styles.js`);
-const STYLE = await getStyle(import.meta.url);
+const { loadStyle } = await import(`${getNx()}/utils/utils.js`);
+const STYLE = await loadStyle(import.meta.url);
+
+const DEFAULT_LOCALES = ['langstore'];
+
+function getLocales(translate) {
+  const locales = new Set(DEFAULT_LOCALES);
+
+  translate?.languages?.data?.forEach((lang) => {
+    lang.locales?.split(',').forEach((loc) => {
+      const dir = loc.split('/').find((part) => part?.trim() !== '');
+      if (dir) {
+        locales.add(dir.trim());
+      }
+    });
+  });
+
+  return locales;
+}
 
 export default class DaSearch extends LitElement {
   static properties = {
     fullpath: { type: String },
+    browseItems: { type: Array },
     _term: { state: true },
     _total: { state: true },
     _matches: { state: true },
@@ -19,11 +35,13 @@ export default class DaSearch extends LitElement {
     _time: { state: true },
     _items: { state: true },
     showReplace: { state: true },
+    _caseSensitive: { state: true },
   };
 
   constructor() {
     super();
     this.setDefault();
+    this._caseSensitive = true;
   }
 
   connectedCallback() {
@@ -54,6 +72,41 @@ export default class DaSearch extends LitElement {
     this._time = null;
   }
 
+  async getSearchScope(startPath) {
+    const isSiteFolder = startPath.split('/').length === 3;
+    if (!isSiteFolder) {
+      return { paths: [startPath], files: [] };
+    }
+
+    const { source } = await getNx2Api();
+    const resp = await source.get(`${startPath}/.da/translate.json`);
+    if (!resp.ok) {
+      return { paths: [startPath], files: [] };
+    }
+
+    const translate = await resp.json();
+    const locales = getLocales(translate);
+
+    if (!locales.size || !this.browseItems?.length) {
+      return { paths: [startPath], files: [] };
+    }
+
+    const paths = [];
+    const files = [];
+
+    this.browseItems.forEach((item) => {
+      if (!locales.has(item.name)) {
+        if (item.ext) {
+          files.push(item);
+        } else {
+          paths.push(item.path);
+        }
+      }
+    });
+
+    return { paths, files };
+  }
+
   async getMatches(startPath, term) {
     const searchTypes = ['.html', '.json', '.svg'];
 
@@ -67,12 +120,20 @@ export default class DaSearch extends LitElement {
         let match;
 
         try {
-          const resp = await daFetch(`${DA_ORIGIN}/source${file.path}`);
+          const { source } = await getNx2Api();
+          const resp = await source.get(file.path);
           const text = await resp.text();
           // Log empty files
           // eslint-disable-next-line no-console
           if (text.length < 2) console.log(file.path);
-          match = text.includes(term) || file.path.split('/').pop().includes(term);
+          const filename = file.path.split('/').pop();
+          if (this._caseSensitive) {
+            match = text.includes(term) || filename.includes(term);
+          } else {
+            const lowerTerm = term.toLowerCase();
+            match = text.toLowerCase().includes(lowerTerm)
+              || filename.toLowerCase().includes(lowerTerm);
+          }
         } catch {
           return { error: 'fetch error' };
         }
@@ -97,7 +158,8 @@ export default class DaSearch extends LitElement {
       }
     };
 
-    const { results } = crawl({ path: startPath, callback: searchFile, throttle: 10 });
+    const { paths, files } = await this.getSearchScope(startPath);
+    const { results } = crawl({ path: paths, callback: searchFile, throttle: 10, files });
     await results;
   }
 
@@ -154,14 +216,12 @@ export default class DaSearch extends LitElement {
       let retryCount = prevRetry;
 
       const getFile = async () => {
-        const getResp = await daFetch(`${DA_ORIGIN}/source${file.path}`);
+        const { source } = await getNx2Api();
+        const getResp = await source.get(file.path);
         const text = await getResp.text();
         const replacedText = text.replaceAll(this._term, replace.value);
         const blob = new Blob([replacedText], { type: 'text/html' });
-        const formData = new FormData();
-        formData.append('data', blob);
-        const opts = { method: 'PUT', body: formData };
-        const postResp = await daFetch(`${DA_ORIGIN}/source${file.path}`, opts);
+        const postResp = await source.save(file.path, { body: blob });
         if (!postResp.ok) return { error: 'Error saving file' };
         this._matches += 1;
         return file;
@@ -207,20 +267,34 @@ export default class DaSearch extends LitElement {
     this.showReplace = !this.showReplace;
   }
 
+  toggleCaseSensitive() {
+    this._caseSensitive = !this._caseSensitive;
+  }
+
   render() {
     return html`
-      <form @submit=${this.handleSearch}>
-        <input type="text" placeholder="Enter search" name="term"/>
+      <form @submit=${this.handleSearch} role="search">
+        <div class="search-input-wrapper">
+          <input type="text" placeholder="Enter search" name="term" aria-label="Search term"/>
+          <button
+            type="button"
+            class="case-toggle${this._caseSensitive ? ' active' : ''}"
+            @click=${this.toggleCaseSensitive}
+            aria-label="Toggle case sensitivity"
+            title="${this._caseSensitive ? 'Case sensitive (click for case insensitive)' : 'Case insensitive (click for case sensitive)'}">
+            Aa
+          </button>
+        </div>
         <input type="submit" value="Search" />
       </form>
       <p>${this.showText ? html`${this.matchText}${this.timeText}` : nothing}</p>
       <div class="replace-pane">
         <form class="da-replace-form${this.showReplace ? nothing : ' hide'}" @submit=${this.handleReplace}>
-          <input type="text" placeholder="Enter replace text" name="replace"/>
+          <input type="text" placeholder="Enter replace text" name="replace" aria-label="Replacement text"/>
           <input type="submit" value="Replace" />
         </form>
         <div class="checkbox-wrapper">
-          <input id="show-replace" type="checkbox" name="item-selected" @click="${this.toggleReplace}">
+          <input id="show-replace" type="checkbox" name="item-selected" @click="${this.toggleReplace}" aria-label="Enable replace mode">
           <label for="show-replace" class="checkbox-label"><span class="${this.showReplace ? 'hide' : nothing}">Replace</span></label>
         </div>
         <input type="checkbox" name="select" style="display: none;">

@@ -1,4 +1,4 @@
-import { getNx } from '../../scripts/utils.js';
+import { getNx, sanitizePathParts } from '../../scripts/utils.js';
 import { DA_ORIGIN } from '../shared/constants.js';
 import { daFetch } from '../shared/utils.js';
 
@@ -32,14 +32,14 @@ async function getBlob(path) {
 
 async function bulkAemAdmin(org, site, files) {
   const paths = files.map((file) => {
-    const [, , ...parts] = file.path.slice(1).split('/');
+    const [, , ...parts] = sanitizePathParts(file.path);
     return `/${parts.join('/')}`.replace('.html', '');
   });
 
   const body = JSON.stringify({ paths, forceUpdate: true, forceSync: true });
   const opts = { body, method: 'POST', headers: { 'Content-Type': 'application/json' } };
 
-  const aemUrl = `https://admin.gov-aem.page/preview/${org}/${site}/main/*`;
+  const aemUrl = `https://admin.ent-aem.page/preview/${org}/${site}/main/*`;
   const resp = await daFetch(aemUrl, opts);
   if (!resp.ok) return { type: 'error', message: 'Error previewing', status: resp.status };
 

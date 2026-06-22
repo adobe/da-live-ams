@@ -1,7 +1,8 @@
 import { daFetch, getFirstSheet } from '../../../shared/utils.js';
-import { getMetadata, parseDom } from './helpers.js';
+import { getMetadata } from '../../utils/helpers.js';
+import { parseDom, aemToContentUrl, daFetchLibrary } from './helpers.js';
 
-const AEM_ORIGIN = ['hlx.page', 'hlx.live', 'aem.page', 'aem.live', 'gov-aem.page', 'gov-aem.live'];
+const AEM_ORIGIN = ['hlx.page', 'hlx.live', 'aem.page', 'aem.live', 'gov-aem.page', 'gov-aem.live', 'ent-aem.page', 'ent-aem.live'];
 
 function isHeading(element) {
   return ['H1', 'H2', 'H3', 'H4', 'H5', 'H6'].some((name) => element?.nodeName === name);
@@ -68,14 +69,25 @@ function getBlockTableHtml(block) {
   return table;
 }
 
-async function fetchAndParseHtml(path, isAemHosted) {
-  const postfix = isAemHosted ? '.plain.html' : '';
-  const resp = await daFetch(`${path}${postfix}`);
-  if (!resp.ok) return null;
+function isAemHosted(path) {
+  try {
+    const { origin } = new URL(path);
+    return AEM_ORIGIN.some((aemOrigin) => origin.endsWith(aemOrigin));
+  } catch {
+    return false;
+  }
+}
 
-  const html = await resp.text();
-  const parser = new DOMParser();
-  return parser.parseFromString(html, 'text/html');
+async function fetchAndParseHtml(path) {
+  const url = isAemHosted(path) ? `${path}.plain.html` : path;
+  try {
+    const resp = await daFetch(url);
+    if (!resp.ok) return { doc: null, notFound: resp.status === 404 };
+    const html = await resp.text();
+    return { doc: new DOMParser().parseFromString(html, 'text/html') };
+  } catch {
+    return { doc: null };
+  }
 }
 
 function getSectionsAndBlocks(doc) {
@@ -149,52 +161,69 @@ function transformBlock(block) {
 
   if (block.nextElementSibling?.classList.contains('library-metadata')) {
     const md = getMetadata(block.nextElementSibling);
-    item.tags = md?.searchtags?.text || '';
-    item.description = md?.description?.text || '';
+    item.tags = md?.searchtags || '';
+    item.description = md?.description || '';
   }
 
   return item;
 }
 
-export async function getBlockVariants(path) {
-  const { origin } = new URL(path);
-  const isAemHosted = AEM_ORIGIN.some((aemOrigin) => origin.endsWith(aemOrigin));
-
-  const doc = await fetchAndParseHtml(path, isAemHosted);
-  if (!doc) return [];
-
+function buildVariants(doc, path) {
   decorateImages(doc.body, path);
-
   const blocks = getSectionsAndBlocks(doc);
-  const groupedBlocks = groupBlocks(blocks);
-  return groupedBlocks.map(transformBlock);
+  return groupBlocks(blocks).map(transformBlock);
 }
+
+export async function getBlockVariants(originalPath, { skipRewrite = false } = {}) {
+  const contentUrl = skipRewrite ? originalPath : aemToContentUrl(originalPath);
+  const { doc, notFound } = await fetchAndParseHtml(contentUrl);
+  if (doc) return buildVariants(doc, contentUrl);
+  if (notFound && contentUrl !== originalPath) {
+    const { doc: fallbackDoc } = await fetchAndParseHtml(originalPath);
+    if (fallbackDoc) return buildVariants(fallbackDoc, originalPath);
+  }
+  return [];
+}
+
+export const urlCache = new Map();
 
 export async function getBlocks(sources) {
   try {
     const sourcesData = await Promise.all(
       sources.map(async (url) => {
+        if (urlCache.has(url)) {
+          return urlCache.get(url);
+        }
+
         try {
-          const resp = await daFetch(url);
+          const { resp, usedFallback } = await daFetchLibrary(url);
           if (!resp.ok) throw new Error('Something went wrong.');
-          return resp.json();
+          const entry = { data: await resp.json(), usedFallback };
+          urlCache.set(url, entry);
+          return entry;
         } catch {
           return null;
         }
       }),
     );
 
-    const blockList = [];
-    sourcesData.forEach((blockData) => {
-      if (!blockData) return;
-      const data = getFirstSheet(blockData);
-      if (!data) return;
-      data.forEach((block) => {
-        if (block.name && block.path) blockList.push(block);
-      });
-    });
+    return sourcesData.reduce((acc, entry) => {
+      if (entry) {
+        const data = getFirstSheet(entry.data);
+        if (data) {
+          data.forEach((block) => {
+            if (block.name && block.path) {
+              acc.push({
+                ...block,
+                loadVariants: getBlockVariants(block.path, { skipRewrite: entry.usedFallback }),
+              });
+            }
+          });
+        }
+      }
 
-    return blockList;
+      return acc;
+    }, []);
   } catch (error) {
     // eslint-disable-next-line no-console
     console.error('Error fetching blocks:', error);

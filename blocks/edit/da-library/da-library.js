@@ -1,83 +1,56 @@
-/* eslint-disable indent */
-import { DOMParser as proseDOMParser, TextSelection } from 'da-y-wrapper';
-import {
-  LitElement,
-  html,
-  render,
-  until,
-  createRef,
-  ref,
-  nothing,
-} from 'da-lit';
-import { getNx } from '../../../scripts/utils.js';
-import { getBlocks, getBlockVariants } from './helpers/index.js';
+import { LitElement, html, nothing } from 'da-lit';
+import { DOMParser as proseDOMParser, DOMSerializer, Slice, TextSelection } from 'da-y-wrapper';
+import { htmlToProse } from '../utils/helpers.js';
+import { getNx, sanitizePathParts } from '../../../scripts/utils.js';
 import getSheet from '../../shared/sheet.js';
 import inlinesvg from '../../shared/inlinesvg.js';
-import { aem2prose } from '../utils/helpers.js';
-import { daFetch } from '../../shared/utils.js';
 import searchFor from './helpers/search.js';
-import { delay, getItems, getLibraryList } from './helpers/helpers.js';
+import {
+  OOTB_PLUGINS,
+  loadLibrary,
+  getItemDetails,
+  getPreviewStatus,
+  daFetchLibrary,
+  ref,
+} from './helpers/helpers.js';
 
 const sheet = await getSheet('/blocks/edit/da-library/da-library.css');
 const buttons = await getSheet(`${getNx()}/styles/buttons.css`);
 
 const ICONS = [
-  '/blocks/edit/img/Smock_ExperienceAdd_18_N.svg',
-  '/blocks/browse/img/Smock_ChevronRight_18_N.svg',
-  '/blocks/edit/img/Smock_AddCircle_18_N.svg',
-  '/blocks/edit/img/Smock_InfoOutline_18_N.svg',
+  '/blocks/edit/img/S2_Icon_ExperienceAdd_20_N.svg',
+  '/blocks/edit/img/S2_Icon_ExperiencePreview_20_N.svg',
+  '/blocks/edit/img/S2_Icon_ChevronRight_20_N.svg',
+  '/blocks/edit/img/S2_Icon_Search_20_N.svg',
+  '/blocks/edit/img/S2_Icon_InfoCircle_20_N.svg',
+  '/blocks/edit/img/S2_Icon_Plugin_20_N.svg',
+  '/blocks/edit/img/S2_Icon_Table_20_N.svg',
+  '/blocks/edit/img/S2_Icon_Template_20_N.svg',
+  '/blocks/edit/img/S2_Icon_CallCenter_20_N.svg',
+  '/blocks/edit/img/S2_Icon_Image_20_N.svg',
+  '/blocks/edit/img/S2_Icon_Placeholder_20_N.svg',
 ];
 
-let accessToken;
-
-function closeLibrary() {
-  const palletePane = window.view.dom.nextElementSibling;
-  const existingPalette = palletePane.querySelector('da-library');
-  if (existingPalette) {
-    existingPalette.remove();
-    return true;
-  }
-  return false;
-}
-
-function scrollToSelection() {
-  const { node } = window.view.domAtPos(window.view.state.selection.anchor);
-  node?.scrollIntoView?.();
-}
-
-// Cache fetched library data
-const libraryListPromise = delay(1500).then(() => getLibraryList());
-const data = {
-  blockDetailItems: new Map(),
-  blocks: null,
-  templateItems: null,
-};
+const searchIndex = {};
 
 class DaLibrary extends LitElement {
   static properties = {
-    _libraryList: { state: true },
-    _libraryDetails: { state: true },
+    config: { attribute: false },
+    _active: { state: true },
+    _preview: { state: true },
     _searchStr: { state: true },
+    _searchResults: { state: true },
   };
 
-  constructor() {
-    super();
-    this._libraryList = [];
-    this._libraryDetails = {};
-    this._searchStr = '';
-    this._searchHasFocus = false;
-  }
-
-  searchInputRef = createRef();
-
-  async connectedCallback() {
+  connectedCallback() {
     super.connectedCallback();
     this.shadowRoot.adoptedStyleSheets = [sheet, buttons];
     inlinesvg({ parent: this.shadowRoot, paths: ICONS });
-    this._libraryList = await libraryListPromise;
+
     window.addEventListener('keydown', this.handleKeydown);
     this.addEventListener('blur', () => window.view?.focus());
-    this.searchInputRef.value.focus();
+
+    this.loadDetails();
   }
 
   disconnectedCallback() {
@@ -85,117 +58,97 @@ class DaLibrary extends LitElement {
     window.removeEventListener('keydown', this.handleKeydown);
   }
 
-  handleKeydown(e) {
-    if (e.key === 'Escape') closeLibrary();
+  updated() {
+    this.dialogCheck();
   }
 
-  handleModalClose() {
-    this.shadowRoot.querySelector('.da-dialog-plugin').close();
-    closeLibrary();
-  }
+  async loadDetails() {
+    for (const plugin of this.config) {
+      // If the plugin has items to load, await them
+      if (plugin.loadItems && !plugin.items) {
+        plugin.items = await plugin.loadItems;
+        // Update the UI immediately
+        this.requestUpdate();
 
-  handleFullsizeModalClose() {
-    this.shadowRoot.querySelector('.da-fs-dialog-plugin').close();
-    closeLibrary();
-  }
-
-  async handleLibSwitch(e, library) {
-    if (library.callback) {
-      library.callback();
-      closeLibrary();
-      return;
-    }
-
-    if (library.experience === 'dialog') {
-      let dialog = this.shadowRoot.querySelector('.da-dialog-plugin');
-      if (dialog) dialog.remove();
-
-      dialog = html`
-        <dialog class="da-dialog-plugin">
-          <div class="da-dialog-header">
-            <div class="da-dialog-header-title">
-              <img src="${library.icon}" />
-              <p>${library.title || library.name}</p>
-            </div>
-            <button class="primary" @click=${this.handleModalClose}>Close</button>
-          </div>
-          ${this.renderPlugin(library, true)}
-        </dialog>
-      `;
-
-      render(dialog, this.shadowRoot);
-
-      this.shadowRoot.querySelector('.da-dialog-plugin').showModal();
-
-      return;
-    }
-
-    if (library.experience === 'fullsize-dialog') {
-      let dialog = this.shadowRoot.querySelector('.da-dialog-plugin');
-      if (dialog) dialog.remove();
-
-      dialog = html`
-        <dialog class="da-fs-dialog-plugin">
-          <div class="da-dialog-header">
-            <div class="da-dialog-header-title">
-              <img src="${library.icon}" />
-              <p>${library.title || library.name}</p>
-            </div>
-            <button class="primary" @click=${this.handleFullsizeModalClose}>Close</button>
-          </div>
-          ${this.renderPlugin(library, true)}
-        </dialog>
-      `;
-
-      render(dialog, this.shadowRoot);
-
-      this.shadowRoot.querySelector('.da-fs-dialog-plugin').showModal();
-
-      return;
-    }
-
-    if (library.experience === 'window') {
-      try {
-        const url = library.sources?.[0] || library.url;
-        if (!url) return;
-        const { pathname } = new URL(url);
-        window.open(url, `${pathname.replaceAll('/', '-')}`);
-      } catch {
-        // eslint-disable-next-line no-console
-        console.log('Could not make plugin URL');
+        // Blocks have another level of
+        // loading to get their variations
+        if (plugin.name === 'blocks') {
+          plugin.items = await Promise.all(plugin.items.map(async (block) => {
+            const variants = await block.loadVariants;
+            return { ...block, variants };
+          }));
+        }
       }
+      this.addToSearchIndex(plugin);
+    }
+  }
+
+  async addToSearchIndex(plugin) {
+    // Return if plugin is already in the index
+    if (searchIndex[plugin.name]) return;
+
+    // Return if it's already in BYO
+    const foundByo = searchIndex.byoPlugins?.some((byo) => byo.name === plugin.name);
+    if (foundByo) return;
+
+    // Add a top level out of the box plugin
+    const isOotb = OOTB_PLUGINS.some((name) => plugin.name === name);
+    if (isOotb) {
+      // Add the default plugin icon, but allow an item to override it
+      searchIndex[plugin.name] = plugin.items.map((item) => ({
+        icon: plugin.icon,
+        ...item,
+      }));
       return;
     }
 
-    const { target } = e;
-    const type = target.dataset.libraryName;
-    target.closest('.palette-pane').classList.add('backward');
-    target.closest('.palette-pane').inert = true;
-    const toShow = this.shadowRoot.querySelector(`[data-library-type="${type}"]`);
-    toShow.classList.remove('forward');
-    toShow.inert = false;
-    const pluginIframe = toShow.querySelector('iframe');
-    if (!pluginIframe) return;
-    pluginIframe.src = pluginIframe.dataset.src;
+    // Add to byo plugins
+    searchIndex.byoPlugins ??= [];
+    searchIndex.byoPlugins.push(plugin);
   }
 
-  handleBack(e) {
-    const { target } = e;
-    target.closest('.palette-pane').classList.add('forward');
-    target.closest('.palette-pane').inert = true;
-    const wrapper = target.closest('.palette-wrapper');
-    const previous = wrapper.querySelector('.backward');
-    previous.classList.remove('backward');
-    previous.inert = false;
+  handleClose() {
+    this.remove();
+  }
+
+  handleKeydown = (e) => {
+    if (e.key === 'Escape') this.handleClose();
+  };
+
+  async handlePluginClick(plugin) {
+    this._active = plugin;
+
+    if (plugin.experience === 'aem-assets') {
+      plugin.callback();
+      this.handleClose();
+    }
+
+    if (plugin.experience === 'window') {
+      const href = plugin.sources?.[0];
+      if (!href) return;
+      window.open(href, href);
+    }
+  }
+
+  dialogCheck() {
+    const dialogs = this.shadowRoot.querySelectorAll('dialog');
+    for (const dialog of dialogs) {
+      dialog.showModal();
+    }
+  }
+
+  handleBack() {
+    this._active = undefined;
   }
 
   handleCloseSearch() {
-    this._searchStr = '';
-    this.searchInputRef.value.value = '';
+    this._searchStr = undefined;
+    this._searchResults = undefined;
   }
 
   handleSearch({ target }) {
     this._searchStr = target.value;
+    this._searchResults = searchFor(target.value, searchIndex, this);
   }
 
   handleSearchInputKeydown(e) {
@@ -222,7 +175,7 @@ class DaLibrary extends LitElement {
       if (prevButton) {
         prevButton.focus();
       } else {
-        this.searchInputRef.value.focus();
+        this.shadowRoot.querySelector('#search').focus();
       }
     }
     if (e.key === 'Enter') {
@@ -236,7 +189,26 @@ class DaLibrary extends LitElement {
     target.closest('li').classList.toggle('is-open');
   }
 
-  handleItemClick(item, insertParagraphAfter = false) {
+  async handleTemplateClick(item) {
+    const { resp } = await daFetchLibrary(item.value, { skipRewrite: item.usedFallback });
+    if (!resp.ok) return;
+    let text = await resp.text();
+
+    // Convert template-metadata to metadata block so it can be copied
+    text = text.replace('class="template-metadata"', 'class="metadata"');
+
+    const { dom } = htmlToProse(text);
+
+    const newNodes = proseDOMParser.fromSchema(window.view.state.schema).parse(dom);
+    window.view.dispatch(window.view.state.tr.replaceSelectionWith(newNodes));
+  }
+
+  handleItemClick(pluginName, item, insertParagraphAfter = false) {
+    if (pluginName === 'templates') {
+      this.handleTemplateClick(item);
+      return;
+    }
+
     const { tr } = window.view.state;
     const insertPos = tr.selection.from;
 
@@ -244,7 +216,7 @@ class DaLibrary extends LitElement {
 
     if (insertParagraphAfter) {
       const paragraph = window.view.state.schema.nodes.paragraph.create();
-        newTr = tr.insert(insertPos, paragraph);
+      newTr = tr.insert(insertPos, paragraph);
     }
 
     newTr = (newTr || tr).replaceSelectionWith(item.parsed);
@@ -258,33 +230,25 @@ class DaLibrary extends LitElement {
 
     if (finalPos === newTr.doc.content.size - 1) {
       // only scroll down if we're at the end of the document
-      scrollToSelection();
+      const { node } = window.view.domAtPos(window.view.state.selection.anchor);
+      node?.scrollIntoView?.();
     }
   }
 
-  handleToolTip(e) {
-    e.stopPropagation();
-    e.target.closest('button').classList.toggle('show-tooltip');
+  async handleOpenPreview(item) {
+    const { org, site, pathname } = getItemDetails(item);
+    this._preview = {
+      name: item.name || item.key,
+      url: `https://${ref}--${site}--${org}.aem.page${pathname}`,
+    };
+
+    // Lazily get the preview status
+    this._preview.ok = await getPreviewStatus({ org, site, pathname });
+    this.requestUpdate();
   }
 
-  async handleTemplateClick(item) {
-    const resp = await daFetch(`${item.value}`);
-    if (!resp.ok) return;
-    const text = await resp.text();
-    const doc = new DOMParser().parseFromString(text, 'text/html');
-    // Convert to a metadata block so it can be copied
-    doc.querySelector('.template-metadata')?.classList.replace('template-metadata', 'metadata');
-    const proseDom = aem2prose(doc);
-    const flattedDom = document.createElement('div');
-    flattedDom.append(...proseDom);
-    const newNodes = proseDOMParser.fromSchema(window.view.state.schema).parse(flattedDom);
-    window.view.dispatch(window.view.state.tr.replaceSelectionWith(newNodes));
-  }
-
-  getParts() {
-    const view = 'edit';
-    const [org, repo, ...path] = window.location.hash.replace('#/', '').split('/');
-    return { view, org, repo, ref: 'main', path: `/${path.join('/')}` };
+  handlePreviewClose() {
+    delete this._preview;
   }
 
   async handlePluginLoad({ target }) {
@@ -296,8 +260,10 @@ class DaLibrary extends LitElement {
       }
       if (e.data.action === 'sendHTML') {
         const dom = new DOMParser().parseFromString(e.data.details, 'text/html');
-        const nodes = proseDOMParser.fromSchema(window.view.state.schema).parse(dom);
-        window.view.dispatch(window.view.state.tr.replaceSelectionWith(nodes));
+        const parsed = proseDOMParser.fromSchema(window.view.state.schema).parse(dom.body);
+        const slice = new Slice(parsed.content, 0, 0);
+        const { from, to } = window.view.state.selection;
+        window.view.dispatch(window.view.state.tr.replaceRange(from, to, slice));
       }
       if (e.data.action === 'setHash') {
         window.location.hash = e.data.details;
@@ -306,291 +272,364 @@ class DaLibrary extends LitElement {
         window.location.href = e.data.details;
       }
       if (e.data.action === 'closeLibrary') {
-        closeLibrary();
+        this.handleClose();
+      }
+      if (e.data.action === 'getSelection') {
+        const { selection } = window.view.state;
+        if (selection.empty) {
+          channel.port1.postMessage({ action: 'error', details: 'No selection found' });
+          return;
+        }
+        const slice = selection.content();
+        const serializer = DOMSerializer.fromSchema(window.view.state.schema);
+        const fragment = serializer.serializeFragment(slice.content);
+        const div = document.createElement('div');
+        div.appendChild(fragment);
+        target.contentWindow.postMessage({ action: 'sendSelection', details: div.innerHTML }, '*');
       }
     };
 
-    if (!accessToken) {
-      const { initIms } = await import('../../shared/utils.js');
-      ({ accessToken } = (await initIms()) || {});
-    }
+    const { pathname, hash } = window.location;
+    const view = pathname.slice(1);
+    const [org, repo, ...path] = sanitizePathParts(hash.slice(1));
 
+    // Wait for iframe to be ready before sending
     setTimeout(() => {
-      const project = this.getParts();
+      if (!target.contentWindow) return;
+
+      const project = { view, org, repo, ref: 'main', path: `/${path.join('/')}` };
+
+      const { token } = window.adobeIMS.getAccessToken();
 
       const message = {
         ready: true,
         project,
         context: project,
+        token,
       };
-      if (accessToken) message.token = accessToken.token;
-      if (target.contentWindow) target.contentWindow.postMessage(message, '*', [channel.port2]);
+
+      target.contentWindow.postMessage(message, '*', [channel.port2]);
     }, 750);
   }
 
-  renderBlockItem(item, icon = false) {
-    const hasDesc = item.description?.trim();
-    return html`
-      <li class="da-library-type-group-detail-item" tabindex="1">
-        <button class="${icon ? 'blocks' : ''}" @click=${() => this.handleItemClick(item, true)}>
-          <div class="da-library-item-button-title">
-            <div>
-              <span class="da-library-group-name">${item.name}</span>
-              <span class="da-library-group-subtitle">${item.variants}</span>
-            </div>
-            <div class="da-library-icons">
-              ${hasDesc ? html`<svg class="icon" @click=${this.handleToolTip}><use href="#spectrum-InfoOutline"/></svg>` : nothing}
-              <svg class="icon"><use href="#spectrum-ExperienceAdd"/></svg>
-            </div>
-          </div>
-          ${hasDesc ? html`<div class="da-library-item-button-tooltip">${item.description}</div>` : nothing}
-        </button>
-      </li>`;
+  handleToolTip(item) {
+    item.showToolTip = !item.showToolTip;
+    this.requestUpdate();
   }
 
-  async renderBlockDetail(path) {
-    if (!data.blockDetailItems.has(path)) {
-      data.blockDetailItems.set(path, await getBlockVariants(path));
+  renderIcon(icon = '#S2_Icon_Plugin', cls = '') {
+    if (icon.startsWith('#')) {
+      return html`<svg class="icon ${cls}"><use href=${icon}></use></svg>`;
     }
-    const items = data.blockDetailItems.get(path);
-    return html`${items.map((item) => this.renderBlockItem(item))}`;
+    return html`<img class="icon" src="${icon}" />`;
   }
 
-  renderBlockGroup(group) {
+  renderPreviewDialog() {
+    if (!this._preview) return nothing;
+
+    const handleClose = () => { this._preview = undefined; };
+
+    const { ok } = this._preview;
+
+    // Hide the iframe while determining if previewed
+    const hideIframe = ok === undefined || ok === false ? 'hide-iframe' : '';
+
+    // Only display an error if the status is known
+    const error = ok === false
+      ? `It appears ${this._preview.name} has not been previewed.`
+      : undefined;
+
     return html`
-      <li class="da-library-type-group">
-        <button class="da-library-type-group-title" @click=${this.handleGroupOpen}>
-          <span class="name">${group.name}</span>
-          <svg class="icon"><use href="#spectrum-chevronRight"/></svg>
-        </button>
-        <ul class="da-library-type-group-details">
-          ${until(this.renderBlockDetail(group.path), html`<span>Loading...</span>`)}
-        </ul>
-      </li>`;
-  }
-
-  renderBlockGroups(groups) {
-    return html`
-      <ul class="da-library-type-list">
-        ${groups.map((group) => this.renderBlockGroup(group))}
-      </ul>`;
-  }
-
-  async renderIcon(url) {
-    const [icon] = await inlinesvg({ paths: [url] });
-    icon.classList.add('icon-preview');
-    return icon;
-  }
-
-  renderAssetItem(item) {
-    return html`
-      <li class="da-library-asset-item">
-        <button class="da-library-type-asset-btn"
-          @click=${() => this.handleItemClick(item)}>
-          <img src="https://content-stg.ssa-da.live${item.path}" />
-          <svg class="icon"><use href="#spectrum-AddCircle"/></svg>
-        </button>
-      </li>`;
-  }
-
-  renderMedia(items) {
-    return html`
-      <ul class="da-library-type-list-assets">
-      ${items.map((item) => this.renderAssetItem(item))}
-      </ul>
+      <dialog class="da-plugin-dialog">
+        <div class="da-dialog-header">
+          <div class="da-dialog-header-title">
+            <p>${this._preview.name} preview</p>
+          </div>
+          <sl-button class="primary outline" @click=${handleClose}>Close</sl-button>
+        </div>
+        <div class="da-library-type-plugin">
+        ${error ? html`<div class="iframe-overlay"><p>${error}</p></div>` : nothing}
+        <iframe
+          class="${hideIframe}"
+          src=${this._preview.url}
+          allow="clipboard-write *"></iframe>
+        </div>
+      </dialog>
     `;
   }
 
-  renderTemplateItem(item, icon = false) {
+  renderBlockItem(item) {
+    const hasDesc = item.description?.trim();
     return html`
-      <li class="da-library-type-item">
-        <button class="da-library-type-item-btn ${icon ? 'templates' : ''}"
-          @click=${() => this.handleTemplateClick(item)}>
-          <div class="da-library-type-item-detail">
-            <span>${item.key}</span>
-            <svg class="icon">
-              <use href="#spectrum-AddCircle"/>
-            </svg>
+      <li class="library-plugin-detail-item" tabindex="1">
+        <div class="library-plugin-detail-item-header">
+          ${item.icon ? this.renderIcon(item.icon, 'item-type') : nothing}
+          <button class="library-plugin-detail-item-title" @click=${() => this.handleItemClick('blocks', item, true)}>
+            <p class="da-library-group-name">${item.name}</p>
+            <p class="da-library-group-subtitle">${item.variants}</p>
+          </button>
+          <div class="library-plugin-detail-item-actions">
+            ${hasDesc ? html`
+              <button
+                class="tooltip"
+                @click=${() => this.handleToolTip(item)}>
+                <svg class="icon"><use href="#S2_Icon_InfoCircle"/></svg>
+              </button>` : nothing}
+              <button class="add" @click=${() => this.handleItemClick('blocks', item, true)}>
+                <svg class="icon"><use href="#S2_Icon_Experience_Add"/></svg>
+              </button>
           </div>
-        </button>
+        </div>
+        ${hasDesc ? html`<div class="da-library-item-description ${item.showToolTip ? 'is-visible' : ''}">${item.description}</div>` : nothing}
       </li>`;
   }
 
-  renderTemplates(items, listName) {
+  renderBlockDetail(block) {
+    return html`${block.variants?.map((variant) => this.renderBlockItem(variant))}`;
+  }
+
+  renderBlockGroups({ items }) {
     return html`
-      <ul class="da-library-type-list da-library-type-list-${listName}">
-      ${items.map((item) => this.renderTemplateItem(item))}
+      <ul class="library-plugin-list library-plugin-list-group">
+        ${items.map((group) => html`
+          <li class="library-plugin-list-item">
+            <div class="library-plugin-list-item-header">
+              <button class="item-title" @click=${this.handleGroupOpen}>
+                  <span class="name">${group.name}</span>
+              </button>
+              <div class="library-plugin-list-item-actions">
+                <button class="preview" @click=${() => this.handleOpenPreview(group)}>
+                  <svg class="icon preview"><use href="#S2_Icon_ExperiencePreview"/></svg>
+                </button>
+                <button  class="expand" @click=${this.handleGroupOpen}>
+                  <svg class="icon"><use href="#S2_Icon_ChevronRight"/></svg>
+                </button>
+                </div>
+              </div>
+            </div>
+            <ul class="library-plugin-list-item-details">
+              ${this.renderBlockDetail(group)}
+            </ul>
+          </li>`)}
       </ul>`;
   }
 
-  renderItems(items, listName, iconType = '') {
+  renderItem(item) {
+    const name = item.title || item.name || item.key || item.value;
+    if (!name) return nothing;
+
+    const previewBtn = item.type === 'templates'
+      ? html`
+        <button class="preview" @click=${() => this.handleOpenPreview(item)}>
+          <svg class="icon preview"><use href="#S2_Icon_ExperiencePreview"/></svg>
+        </button>`
+      : nothing;
+
+    const clickHandler = () => {
+      if (item.experience) {
+        this.handlePluginClick(item);
+        return;
+      }
+      this.handleItemClick(item.type, item);
+    };
+
+    // Non-plugins (no experience) get an add button
+    const addBtn = !item.experience ? html`
+      <button class="add" @click=${clickHandler}>
+        <svg class="icon"><use href="#S2_Icon_Experience_Add"/></svg>
+      </button>` : nothing;
+
     return html`
-      <ul class="da-library-type-list da-library-type-list-${listName}">
-        ${items.map((item) => {
-          const name = item.value || item.name || item.key;
-          if (!name) return null;
-          return html`
-            <li class="da-library-type-item">
-              <button class="da-library-type-item-btn ${iconType}"
-                @click=${() => this.handleItemClick(item)}>
-                <div class="da-library-type-item-detail">
-                  ${item.icon && !item.url ? until(this.renderIcon(item.icon)) : ''}
-                  <span>${name}</span>
-                  <svg class="icon">
-                    <use href="#spectrum-AddCircle"/>
-                  </svg>
-                </div>
-              </button>
-            </li>`;
-        })}
+      <li class="library-plugin-detail-item" tabindex="1">
+        <div class="library-plugin-detail-item-header">
+          ${item.icon ? this.renderIcon(item.icon, 'item-type') : nothing}
+          <button class="library-plugin-detail-item-title" @click=${clickHandler}>
+            <p class="da-library-group-name">${name}</p>
+          </button>
+          <div class="library-plugin-detail-item-actions">
+            ${previewBtn}
+            ${addBtn}
+          </div>
+        </div>
+      </li>`;
+  }
+
+  renderItems(plugin) {
+    const { items } = plugin;
+
+    return html`
+      <ul class="library-plugin-list">
+        ${items.map((item) => this.renderItem({ type: plugin.name, ...item }))}
       </ul>`;
   }
 
   renderSearch() {
-    return searchFor(this._searchStr, data, this);
+    if (!this._searchResults?.length) return html`<p>No results</p>`;
+
+    return html`
+      <ul class="library-plugin-list library-search-results" @keydown=${this.handleSearchKeydown}>
+        ${this._searchResults.map((item) => {
+          const { type } = item;
+          if (type === 'blocks') return this.renderBlockItem(item);
+          return this.renderItem(item);
+        })}
+      </ul>`;
   }
 
-  renderPlugin(library, preload) {
-    const url = library.sources?.[0] || library.url;
+  renderPlugin(plugin) {
+    const isActive = this._active === plugin;
+    const url = isActive ? plugin.sources?.[0] : nothing;
+    const loader = isActive ? this.handlePluginLoad : nothing;
 
     return html`
       <div class="da-library-type-plugin">
         <iframe
-          data-src="${preload ? null : url}"
-          src="${preload ? url : null}"
-          @load=${this.handlePluginLoad}
+          src=${url}
+          @load=${loader}
           allow="clipboard-write *"></iframe>
       </div>`;
   }
 
-  async renderLibrary({ name, sources, url, format, class: className }) {
-    const isPlugin = className.split(' ').some((val) => val === 'is-plugin');
+  renderPluginDetail(plugin) {
+    // Blocks get special treatment due to grouping
+    if (plugin.name === 'blocks') return this.renderBlockGroups(plugin);
 
-    if (isPlugin) return this.renderPlugin({ sources, url });
-
-    if (name === 'blocks') {
-      if (!data.blocks) {
-        data.blocks = await getBlocks(sources);
-      }
-      return this.renderBlockGroups(data.blocks);
+    // Most OOTB plugins use the default renderItems
+    if (OOTB_PLUGINS.some((name) => plugin.name === name)) {
+      return this.renderItems(plugin);
     }
 
-    if (name === 'templates') {
-      if (!data.templateItems) {
-        data.templateItems = await getItems(sources, name, format);
-      }
-      if (data.templateItems.length) {
-        return this.renderTemplates(data.templateItems, name);
-      }
-      return html`No templates found.`;
-    }
+    // This is a BYO plugin
+    return this.renderPlugin(plugin);
+  }
 
-    if (name === 'AEM Assets') {
-      return nothing;
-    }
+  renderPluginDialog() {
+    // Only render if active plugin is a dialog
+    if (!this._active?.experience?.includes('dialog')) return nothing;
 
-    if (name === 'media') {
-      const resp = await daFetch(sources[0]);
-      const json = await resp.json();
-      return this.renderMedia(json);
-    }
+    const plugin = this._active;
+    return html`
+      <dialog class="da-plugin-dialog experience-${plugin.experience}">
+        <div class="da-dialog-header">
+          <div class="da-dialog-header-title">
+            ${this.renderIcon(plugin.icon)}
+            <p>${plugin.title || plugin.name}</p>
+          </div>
+          <sl-button class="primary outline" @click=${this.handleBack}>Close</sl-button>
+        </div>
+        ${this.renderPlugin(plugin)}
+      </dialog>
+    `;
+  }
 
-    if (!data[name]) {
-      data[name] = await getItems(sources, name, format);
-    }
+  renderInlinePlugins() {
+    const filtered = this.config.filter((plugin) => plugin.experience === 'inline');
 
-    if (data[name].length) {
-      return this.renderItems(data[name], name);
-    }
+    return filtered.map((plugin) => {
+      const isActive = this._active === plugin;
 
-    return html`${name}`;
+      const isByo = !OOTB_PLUGINS.find((ootb) => plugin.name === ootb);
+
+      // If there are items, or it doesn't have items to load (byo plugin), it's ready
+      const isReady = plugin.items || !plugin.loadItems;
+
+      return html`
+        <div class="library-pane library-pane-inline ${isByo ? 'plugin-type-byo' : ''} ${isActive ? '' : 'forward'}" ?inert=${!isActive}>
+          <div class="pane-header">
+            <button class="pane-back" @click=${this.handleBack}>Back</button>
+            <p class="pane-title">${plugin.title || plugin.name}</p>
+          </div>
+          ${isReady ? this.renderPluginDetail(plugin) : html`</p>Loading...</p>`}
+        </div>
+      `;
+    });
+  }
+
+  renderMainMenuItem(plugin) {
+    return html`
+      <li class="library-main-menu-item">
+        <button class="library-main-menu-btn" @click=${() => this.handlePluginClick(plugin)}>
+          ${this.renderIcon(plugin.icon)}
+          <span class="plugin-title">${plugin.title || plugin.name}</span>
+        </button>
+      </li>`;
   }
 
   renderMainMenu() {
     return html`
-      <ul class="da-library-item-list da-library-item-list-main">
-        ${this._libraryList.map(
-          (library) => html`
-          <li>
-            <button
-              data-library-name="${library.name}"
-              class="${library.class || library.name} ${library.url ? 'is-plugin' : ''}"
-              style="${library.icon ? `background-image: url(${library.icon})` : ''}"
-              @click=${(e) => this.handleLibSwitch(e, library)}>
-              <span class="library-type-name">${library.title || library.name}</span>
-            </button>
-          </li>`,
-        )}
+      <ul class="library-main-menu-list">
+        ${this.config.map((plugin) => this.renderMainMenuItem(plugin))}
       </ul>`;
   }
 
-  render() {
+  renderSearchInput() {
     return html`
-      <div class="palette-wrapper">
-      <button class="da-library-close" @click=${closeLibrary}></button>
-        <div class="palette-pane">
-          <div class="palette-pane-header">
-            ${this._searchStr && html`<button class="palette-back" @click=${this.handleCloseSearch}>Back</button>`}
-            <h2>Library</h2>
-          </div>
-          <div class="da-library-search">
-            <input
-              ${ref(this.searchInputRef)}
-              class="da-library-search-input"
-              id="search"
-              name="search"
-              type="text"
-              @input=${this.handleSearch}
-              @keydown=${this.handleSearchInputKeydown}
-              placeholder="Search everything" />
-          </div>
-          ${this._searchStr ? this.renderSearch() : this.renderMainMenu()}
+      <div class="library-search">
+        <div class="icon-container">
+          ${this.renderIcon('#S2_Icon_Search')}
         </div>
-        ${this._libraryList.map(
-          (library) => html`
-          <div class="palette-pane forward" data-library-type="${library.name}" inert>
-            <div class="palette-pane-header">
-              <button class="palette-back" @click=${this.handleBack}>Back</button>
-              <h2>${library.name}</h2>
-            </div>
-            ${until(this.renderLibrary(library), html`<span>Loading...</span>`)}
-          </div>
-        `,
-        )}
-      </div>
-    `;
+        <input
+          id="search"
+          name="search"
+          type="text"
+          aria-label="Search library"
+          .value=${this._searchStr || ''}
+          @input=${this.handleSearch}
+          @keydown=${this.handleSearchInputKeydown}
+          placeholder="Search everything" />
+      </div>`;
   }
 
-  renderPluginItem(plugin, icon = false) {
+  render() {
+    const inlineActive = this._active?.experience === 'inline';
+
     return html`
-      <li class="da-library-type-group-detail-item">
-        <button class="${icon ? 'plugins' : ''}" @click=${(e) => this.handleLibSwitch(e, plugin)}>
-          <div>
-            <span class="da-library-group-name">${plugin.name}</span>
-          </div>
-        </button>
-      </li>`;
+      <button id="library-close" @click=${this.handleClose}></button>
+      <div class="library-pane main-menu-pane ${inlineActive ? 'backward' : ''}" ?inert=${inlineActive}>
+        <div class="pane-header">
+          ${this._searchStr
+            ? html`<button class="pane-back" @click=${this.handleCloseSearch}>Back</button>`
+            : nothing}
+          <p class="pane-title">Library</p>
+        </div>
+        ${this.renderSearchInput()}
+        ${this._searchStr ? this.renderSearch() : this.renderMainMenu()}
+      </div>
+      ${this.renderInlinePlugins()}
+      ${this.renderPreviewDialog()}
+      ${this.renderPluginDialog()}
+    `;
   }
 }
 
 customElements.define('da-library', DaLibrary);
 
-const CLOSE_DROPDOWNS_EVENT = 'pm-close-dropdowns';
-
-export default function toggleLibrary() {
-  const libraryWasOpen = closeLibrary();
-  if (libraryWasOpen) return;
-
-  // close any other dropdowns
-  window.dispatchEvent(new CustomEvent(CLOSE_DROPDOWNS_EVENT));
-
-  const palette = document.createElement('da-library');
-  const palletePane = window.view.dom.nextElementSibling;
-  palletePane.append(palette);
-
-  const closePaletteListener = () => {
-    palette.remove();
-    window.removeEventListener(CLOSE_DROPDOWNS_EVENT, closePaletteListener);
-  };
-  window.addEventListener(CLOSE_DROPDOWNS_EVENT, closePaletteListener);
+function getElements() {
+  const pane = window.view.dom?.parentElement?.querySelector('.da-palettes');
+  if (!pane) return {};
+  const existing = pane.querySelector('da-library');
+  return { pane, existing };
 }
+
+export default async function toggleLibrary() {
+  // See if there is an existing element
+  const { pane, existing } = getElements();
+
+  // Remove it from the DOM if it exists
+  if (existing) {
+    existing.remove();
+    return;
+  }
+
+  // Create the library component if it didn't exist
+  const cmp = document.createElement('da-library');
+
+  // Assign the top level items as soon as possible
+  cmp.config = await loadLibrary();
+
+  // Attach to the DOM
+  pane.append(cmp);
+}
+
+// Pre-load library data on import
+loadLibrary();

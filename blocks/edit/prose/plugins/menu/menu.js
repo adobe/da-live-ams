@@ -1,6 +1,7 @@
 import {
   DOMParser,
   Plugin,
+  PluginKey,
   addColumnAfter,
   addColumnBefore,
   deleteColumn,
@@ -25,7 +26,7 @@ import {
 } from 'da-y-wrapper';
 
 import openPrompt from '../../../da-palette/da-palette.js';
-import openLibrary from '../../../da-library/da-library.js';
+import toggleLibrary from './toggleLibrary.js';
 import { handleUndo, handleRedo } from '../keyHandlers.js';
 import insertTable from '../../table.js';
 import { linkItem, removeLinkItem } from './linkItem.js';
@@ -216,10 +217,10 @@ function markItem(markType, options) {
   return cmdItem(toggleMark(markType), passedOptions);
 }
 
-function item(label, cmd, css, title) {
+function tableItem(label, cmd, css) {
   return new MenuItem({
     label,
-    title: title || label,
+    title: label,
     select: cmd,
     run: cmd,
     class: css,
@@ -228,15 +229,15 @@ function item(label, cmd, css, title) {
 
 function getTableMenu() {
   return [
-    item('Insert column before', addColumnBefore, 'addColBefore', 'Insert column before'),
-    item('Insert column after', addColumnAfter, 'addColumnAfter', 'Insert column after'),
-    item('Delete column', deleteColumn, 'deleteColumn', 'Delete column'),
-    item('Insert row before', addRowBefore, 'addRowBefore', 'Insert row before'),
-    item('Insert row after', addRowAfter, 'addRowAfter', 'Insert row after'),
-    item('Delete row', deleteRow, 'deleteRow', 'Delete row'),
-    item('Merge cells', mergeCells, 'mergeCells', 'Merge cells'),
-    item('Split cell', splitCell, 'splitCell', 'Split cell'),
-    item('Delete table', deleteTable, 'deleteTable', 'Delete table'),
+    tableItem('Insert column before', addColumnBefore, 'addColBefore'),
+    tableItem('Insert column after', addColumnAfter, 'addColumnAfter'),
+    tableItem('Delete column', deleteColumn, 'deleteColumn'),
+    tableItem('Insert row before', addRowBefore, 'addRowBefore'),
+    tableItem('Insert row after', addRowAfter, 'addRowAfter'),
+    tableItem('Delete row', deleteRow, 'deleteRow'),
+    tableItem('Merge cells', mergeCells, 'mergeCells'),
+    tableItem('Split cell', splitCell, 'splitCell'),
+    tableItem('Delete block', deleteTable, 'deleteTable'),
   ];
 }
 
@@ -378,7 +379,7 @@ function getMenu(view) {
       label: 'Library',
       enable() { return true; },
       run() {
-        openLibrary();
+        toggleLibrary();
       },
       class: 'open-library',
     }),
@@ -428,7 +429,10 @@ function getMenu(view) {
   return { menu, update };
 }
 
+const menuKey = new PluginKey('menu');
+
 export default new Plugin({
+  key: menuKey,
   props: {
     handleDOMEvents: {
       focus: (view) => {

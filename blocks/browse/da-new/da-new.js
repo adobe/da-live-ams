@@ -1,12 +1,13 @@
 import { LitElement, html } from 'da-lit';
-import { saveToDa } from '../../shared/utils.js';
-import { getNx } from '../../../scripts/utils.js';
+import { sanitizeName } from '../../shared/utils.js';
+import { getNx, getNx2Api } from '../../../scripts/utils.js';
 import getEditPath from '../shared.js';
 
 // Styles & Icons
-const { default: getStyle } = await import(`${getNx()}/utils/styles.js`);
-const STYLE = await getStyle(import.meta.url);
+const { loadStyle } = await import(`${getNx()}/utils/utils.js`);
+const STYLE = await loadStyle(import.meta.url);
 
+const EMPTY_DOC = '<body><header></header><main><div></div></main><footer></footer></body>';
 const INPUT_ERROR = 'da-input-error';
 
 export default class DaNew extends LitElement {
@@ -14,12 +15,12 @@ export default class DaNew extends LitElement {
     fullpath: { type: String },
     editor: { type: String },
     permissions: { attribute: false },
-    _createShow: { attribute: false },
-    _createType: { attribute: false },
-    _createFile: { attribute: false },
-    _createName: { attribute: false },
-    _fileLabel: { attribute: false },
-    _externalUrl: { attribute: false },
+    _createShow: { state: true },
+    _createType: { state: true },
+    _createFile: { state: true },
+    _createName: { state: true },
+    _fileLabel: { state: true },
+    _externalUrl: { state: true },
   };
 
   connectedCallback() {
@@ -48,7 +49,13 @@ export default class DaNew extends LitElement {
   }
 
   handleNameChange(e) {
-    this._createName = e.target.value.replaceAll(/[^a-zA-Z0-9]/g, '-').toLowerCase();
+    const normalized = sanitizeName(e.target.value);
+    // Explicitly sync the DOM value: when two invalid chars are typed in a
+    // row, the sanitized result can be identical to the previous value, so
+    // Lit's property binding would not re-render and the raw typed value
+    // would remain in the input.
+    e.target.value = normalized;
+    this._createName = normalized;
     if (e.target.placeholder === 'name') {
       e.target.classList.remove(INPUT_ERROR);
     }
@@ -60,42 +67,44 @@ export default class DaNew extends LitElement {
 
   async handleSave() {
     const nameInput = this.shadowRoot.querySelector('.da-actions-input[placeholder="name"]');
-    if (!this._createName) {
+    const finalName = sanitizeName(this._createName || '', { trimTrailing: true });
+    if (!finalName) {
       if (nameInput) nameInput.classList.add(INPUT_ERROR);
       return;
     }
+    this._createName = finalName;
     if (nameInput) nameInput.classList.remove(INPUT_ERROR);
 
     let ext;
-    let formData;
+    let data;
     switch (this._createType) {
       case 'document':
         ext = 'html';
+        data = EMPTY_DOC;
         break;
       case 'sheet':
         ext = 'json';
         break;
       case 'link':
         ext = 'link';
-        formData = new FormData();
-        formData.append(
-          'data',
-          new Blob([JSON.stringify({ externalUrl: this._externalUrl })], { type: 'application/json' }),
-        );
+        data = JSON.stringify({ externalUrl: this._externalUrl });
         break;
       default:
         break;
     }
     let path = `${this.fullpath}/${this._createName}`;
     if (ext) path += `.${ext}`;
-    const editPath = getEditPath({ path, ext, editor: this.editor });
-    if (ext && ext !== 'link') {
-      window.location = editPath;
+    const { source } = await getNx2Api();
+    if (this._createType === 'folder') {
+      await source.createFolder(path);
+      this.sendNewItem({ name: this._createName, path });
+    } else if (ext === 'link') {
+      await source.save(path, { body: data });
+      this.sendNewItem({ name: this._createName, path, ext });
     } else {
-      await saveToDa({ path, formData });
-      const item = { name: this._createName, path };
-      if (ext) item.ext = ext;
-      this.sendNewItem(item);
+      // Sheet skips the save — the editor creates it on first load.
+      if (ext === 'html') await source.save(path, { body: data });
+      window.location = getEditPath({ path, ext, editor: this.editor });
     }
     this.resetCreate();
   }
@@ -108,14 +117,15 @@ export default class DaNew extends LitElement {
     }
 
     e.preventDefault();
-    const formData = new FormData(e.target);
+    const file = new FormData(e.target).get('data');
     const split = this._fileLabel.split('.');
     const ext = split.pop();
-    const name = split.join('.').replaceAll(/\W+/g, '-').toLowerCase();
-    const filename = `${split.join('.').replaceAll(/\W+/g, '-').toLowerCase()}.${ext}`;
+    const name = sanitizeName(split.join('.'), { allowDot: true, trimTrailing: true });
+    const filename = `${name}.${ext}`;
     const path = `${this.fullpath}/${filename}`;
 
-    await saveToDa({ path, formData });
+    const { source } = await getNx2Api();
+    await source.save(path, { body: file });
 
     const item = { name, path, ext };
     this.sendNewItem(item);

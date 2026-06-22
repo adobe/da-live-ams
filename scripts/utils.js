@@ -9,51 +9,86 @@
  * OF ANY KIND, either express or implied. See the License for the specific language
  * governing permissions and limitations under the License.
  */
-export const codeBase = `${import.meta.url.replace('/scripts/utils.js', '')}`;
 
-export function sanitiseRef(ref) {
-  if (!ref) return null;
+export function sanitizeName(name, preserveDots = true, allowUnderscores = true) {
+  if (!name) return null;
 
-  return ref.toLowerCase()
+  if (preserveDots && name.indexOf('.') !== -1) {
+    return name
+      .split('.')
+      .map((part) => sanitizeName(part, true, allowUnderscores))
+      .join('.');
+  }
+
+  const pattern = allowUnderscores ? /[^a-z0-9_]+/g : /[^a-z0-9]+/g;
+
+  return name
+    .toLowerCase()
     .normalize('NFD')
     .replace(/[\u0300-\u036f]/g, '')
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-|-$/g, '');
+    .replace(pattern, '-')
+    .replace(/-$/g, '');
 }
+
+export function sanitizePathParts(path) {
+  const parts = path.slice(1)
+    .toLowerCase()
+    .split('/');
+  return parts
+    .map((name, i) => (name ? sanitizeName(name, true, i < parts.length - 1) : ''))
+    // remove path traversal parts, and empty strings unless at the end
+    .filter((name, i, filtered) => !/^[.]{1,2}$/.test(name) && (name !== '' || i === filtered.length - 1));
+}
+
+export function sanitizePath(path) {
+  return `/${sanitizePathParts(path).join('/')}`;
+}
+
+// Determine what version of NX to load
+let nxVer = document.head.querySelector('[name="nxver"]')?.getAttribute('content');
+if (!nxVer) nxVer = sanitizeName(new URLSearchParams(window.location.search).get('nxver'));
+
+/** Determine NX filenames */
+export const nxJS = nxVer ? '/scripts/nx.js' : '/scripts/nexter.js';
+export const nxCSS = nxVer ? '/styles/styles.css' : '/styles/nexter.css';
 
 export const [setNx, getNx] = (() => {
   let nx;
+
   return [
     (nxBase, location) => {
+      // Version nxBase if supplied from query param
+      const nxVerBase = nxVer ? `${nxBase}2` : nxBase;
+
       nx = (() => {
         const { hostname, search } = location || window.location;
-        const branch = sanitiseRef(new URLSearchParams(search).get('nx')) || 'main';
-        // TODO: adopt da-nx code over nexter code.
-        if (hostname.includes('gov-aem')) return `https://${branch}--da-nx-ams--ams-eds.gov-aem.live/nx`;
-        if (!(hostname.includes('.hlx.') || hostname.includes('.aem.') || hostname.includes('local'))) return nxBase;
-        // const branch = sanitiseRef(new URLSearchParams(search).get('nx')) || 'main';
-        if (branch === 'local') return 'http://localhost:6456/nx';
-        return `https://${branch}--da-nx-ams--ams-eds.gov-aem.live/nx`;
+        const nxBaseParam = sanitizeName(new URLSearchParams(search).get('nx'));
+        const isProd = !(hostname.includes('.aem.') || hostname.includes('.ent-aem.') || hostname.includes('local'));
+
+        // If no custom nexter branch & on prod, use the default CDN route
+        if (!nxBaseParam && isProd) return nxVerBase;
+
+        // Determine set a branch regardless of param
+        const branch = nxBaseParam || 'main';
+
+        // Local is a special key to use nexter from localhost
+        if (branch === 'local') return `http://localhost:6456${nxVerBase}`;
+
+        // Otherwise use a fully qualified branch
+        return `https://${branch}--da-nx-ams-1128-west--ssa-eds.ent-aem.live${nxVerBase}`;
       })();
       return nx;
     }, () => nx,
   ];
 })();
 
-export function decorateArea(area = document) {
-  const eagerLoad = (parent, selector) => {
-    const img = parent.querySelector(selector);
-    img?.removeAttribute('loading');
-  };
+export const getNx2 = () => {
+  const nx = getNx();
+  return nx.endsWith('/nx') ? `${nx}2` : nx;
+};
 
-  (async function loadLCPImage() {
-    const hero = area.querySelector('.nx-hero, .hero');
-    if (!hero) {
-      eagerLoad(area, 'img');
-      return;
-    }
-
-    eagerLoad(hero, 'div:first-child img');
-    eagerLoad(hero, 'div:last-child > div:last-child img');
-  }());
-}
+let nx2ApiPromise;
+export const getNx2Api = () => {
+  nx2ApiPromise ??= import(`${getNx2()}/utils/api.js`);
+  return nx2ApiPromise;
+};

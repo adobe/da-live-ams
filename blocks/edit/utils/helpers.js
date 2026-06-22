@@ -1,132 +1,20 @@
+import { DOMSerializer, Y } from 'da-y-wrapper';
+import { aem2doc, getSchema, yDocToProsemirror } from 'da-parser';
 import { AEM_ORIGIN, DA_ORIGIN } from '../../shared/constants.js';
 import prose2aem from '../../shared/prose2aem.js';
-import { daFetch } from '../../shared/utils.js';
+import { daFetch, getSidekickConfig } from '../../shared/utils.js';
+import { getNx2Api } from '../../../scripts/utils.js';
+
+export function isURL(text) {
+  try {
+    const url = new URL(text);
+    return url.protocol === 'https:';
+  } catch {
+    return false;
+  }
+}
 
 const AEM_PERMISSION_TPL = '{"users":{"total":1,"limit":1,"offset":0,"data":[]},"data":{"total":1,"limit":1,"offset":0,"data":[{}]},":names":["users","data"],":version":3,":type":"multi-sheet"}';
-
-function getBlockName(block) {
-  const classes = block.className.split(' ');
-  const name = classes.shift();
-  return classes.length > 0 ? `${name} (${classes.join(', ')})` : name;
-}
-
-function handleRow(row, maxCols, table) {
-  const tr = document.createElement('tr');
-  const cells = [...row.children];
-  cells.forEach((cell, idx) => {
-    const td = document.createElement('td');
-    if (cells.length < maxCols && idx === cells.length - 1) {
-      td.setAttribute('colspan', maxCols - idx);
-    }
-    td.innerHTML = cells[idx].innerHTML;
-    tr.append(td);
-  });
-  table.append(tr);
-}
-
-export function getTable(block) {
-  const name = getBlockName(block);
-  const rows = [...block.children];
-  const maxCols = rows.reduce((cols, row) => (
-    row.children.length > cols ? row.children.length : cols), 0);
-  const table = document.createElement('table');
-  const headerRow = document.createElement('tr');
-
-  const td = document.createElement('td');
-  td.setAttribute('colspan', maxCols);
-  td.append(name);
-
-  headerRow.append(td);
-  table.append(headerRow);
-  rows.forEach((row) => { handleRow(row, maxCols, table); });
-  return table;
-}
-
-function para() {
-  return document.createElement('p');
-}
-
-export function aem2prose(doc) {
-  // Fix BRs
-  const brs = doc.querySelectorAll('p br');
-  brs.forEach((br) => br.remove());
-
-  // Els with da-diff-added property get wrapped in the da-diff-added element
-  const diffAddedEls = doc.querySelectorAll('[da-diff-added]');
-  diffAddedEls.forEach((el) => {
-    const div = document.createElement('da-diff-added');
-    div.setAttribute('da-diff-added', '');
-    if (el.classList.contains('block-group-start')) {
-      div.className = 'da-group';
-    }
-    el.parentElement.insertBefore(div, el);
-    div.appendChild(el);
-  });
-
-  // Fix blocks
-  const blocks = doc.querySelectorAll('main > div > div, da-diff-deleted > div, da-diff-added > div, da-diff-deleted.da-group > div > div, da-diff-added.da-group > div > div');
-  blocks.forEach((block) => {
-    if (block.className?.includes('loc-')) return;
-    const table = getTable(block);
-    block.parentElement.replaceChild(table, block);
-    table.insertAdjacentElement('beforebegin', para());
-    table.insertAdjacentElement('afterend', para());
-  });
-
-  // Fix pictures
-  const imgs = doc.querySelectorAll('picture img');
-  imgs.forEach((img) => {
-    const pic = img.closest('picture');
-    pic.parentElement.replaceChild(img, pic);
-  });
-
-  // Fix three dashes
-  const paras = doc.querySelectorAll('p');
-  paras.forEach((p) => {
-    if (p.textContent.trim() === '---') {
-      const hr = document.createElement('hr');
-      p.parentElement.replaceChild(hr, p);
-    }
-  });
-
-  // Fix da-diff-* list items
-  const lis = doc.querySelectorAll('main > div > :is(ul, ol) > :is(da-diff-added, da-diff-deleted)');
-  lis.forEach((li) => {
-    const isDiffDeleted = li.nodeName === 'DA-DIFF-DELETED';
-    const isDiffAdded = li.nodeName === 'DA-DIFF-ADDED';
-
-    if (!isDiffDeleted && !isDiffAdded) return;
-
-    if (isDiffDeleted && li.firstChild?.nodeName === 'LI' && li.firstChild.children.length === 0) {
-      li.firstChild.remove();
-    }
-
-    if (li.firstChild?.nodeName === 'LI') {
-      const innerLi = li.firstChild;
-      const newLi = document.createElement('li');
-      const diffElement = document.createElement(isDiffDeleted ? 'da-diff-deleted' : 'da-diff-added');
-
-      while (innerLi.firstChild) {
-        diffElement.appendChild(innerLi.firstChild);
-      }
-
-      newLi.appendChild(diffElement);
-      li.parentElement.replaceChild(newLi, li);
-    }
-  });
-
-  // Fix sections
-  const sections = doc.body.querySelectorAll('main > div');
-  return [...sections].map((section, idx) => {
-    const fragment = new DocumentFragment();
-    if (idx > 0) {
-      const hr = document.createElement('hr');
-      fragment.append(para(), hr, para());
-    }
-    fragment.append(...section.querySelectorAll(':scope > *'));
-    return fragment;
-  });
-}
 
 /* eslint-disable max-len */
 /**
@@ -153,20 +41,31 @@ function parseAemError(xError) {
   return xError.replace('[admin] ', '');
 }
 
-export async function getCdnConfig(path) {
-  const [org, site] = path.slice(1).toLowerCase().split('/');
-  const resp = await daFetch(`${AEM_ORIGIN}/config/${org}/sites/${site}.json`);
-  if (!resp.ok) {
-    // eslint-disable-next-line no-console
-    console.warn(`Cannot fetch site config. - Status: ${resp.status}`);
-    return { error: 'Cannot fetch site config.', status: resp.status };
-  }
-  const json = await resp.json();
-  if (!json.cdn) return {};
-  return {
-    preview: json.cdn.preview?.host,
-    prod: json.cdn.prod?.host,
+export async function getAemHrefs({ path }) {
+  // Mine the path for different parts
+  const [org, site, ...parts] = path.slice(1).split('/');
+
+  // The pathname as supplied (may include snapshot prefix)
+  const pathname = `/${parts.join('/')}`;
+
+  // If a snapshot, remove both parts, but keep the name
+  const snapshot = parts[0] === '.snapshots' && parts.splice(0, 2)[1];
+
+  // Normalize SK props to be more "Config Bus" like
+  const { host, liveHost, previewHost: preview } = await getSidekickConfig({ org, site });
+  const prod = host || liveHost;
+
+  const hrefs = {
+    preview: new URL(pathname, `https://${preview}`),
+    prod: new URL(pathname, `https://${prod}`),
   };
+
+  if (snapshot) {
+    const snapPath = `/${parts.join('/')}`;
+    hrefs.review = new URL(snapPath, `https://${snapshot}--main--${site}--${org}.aem.reviews`);
+  }
+
+  return hrefs;
 }
 
 export async function saveToAem(path, action) {
@@ -193,13 +92,9 @@ export async function saveToAem(path, action) {
 async function saveHtml(fullPath) {
   const editor = window.view.root.querySelector('.ProseMirror').cloneNode(true);
   const html = prose2aem(editor, false);
-  const blob = new Blob([html], { type: 'text/html' });
 
-  const formData = new FormData();
-  formData.append('data', blob);
-
-  const opts = { method: 'PUT', body: formData };
-  return daFetch(fullPath, opts);
+  const { source } = await getNx2Api();
+  return source.save(fullPath, { body: html });
 }
 
 function formatSheetData(jData) {
@@ -282,50 +177,45 @@ export function convertSheets(sheets) {
   return json;
 }
 
-async function saveJson(fullPath, sheets, jsonToSave, dataType = 'blob') {
+async function saveJson(path, sheets, jsonToSave, type = 'sheet') {
   const json = jsonToSave || convertSheets(sheets);
+  const body = JSON.stringify(json);
 
-  const formData = new FormData();
+  const { source, config } = await getNx2Api();
 
-  if (dataType === 'blob') {
-    const blob = new Blob([JSON.stringify(json)], { type: 'application/json' });
-    formData.append('data', blob);
+  if (type === 'config') {
+    return config.save(path, { body });
   }
 
-  if (dataType === 'config') {
-    formData.append('config', JSON.stringify(json));
-  }
-
-  const opts = { method: 'PUT', body: formData };
-  return daFetch(fullPath, opts);
+  // type === 'sheet'
+  return source.save(path, { body });
 }
 
-export function saveToDa(pathname, sheet) {
+export async function saveToDa(pathname, sheet) {
   const suffix = sheet ? '.json' : '.html';
-  const fullPath = `${DA_ORIGIN}/source${pathname}${suffix}`;
+  const fullPath = `${pathname}${suffix}`;
 
   if (!sheet) return saveHtml(fullPath);
   return saveJson(fullPath, sheet);
 }
 
 export function saveDaConfig(pathname, sheet) {
-  const fullPath = `${DA_ORIGIN}/config${pathname}`;
-  return saveJson(fullPath, sheet, null, 'config');
+  return saveJson(pathname, sheet, null, 'config');
 }
 
-export async function saveDaVersion(pathname, ext = 'html') {
-  const fullPath = `${DA_ORIGIN}/versionsource${pathname}.${ext}`;
+export async function saveDaVersion(pathname, label = 'Published') {
+  const fullPath = `${DA_ORIGIN}/versionsource${pathname}`;
 
   const opts = {
     method: 'POST',
-    body: JSON.stringify({ label: 'Published' }),
+    body: JSON.stringify({ label }),
   };
 
   try {
     await daFetch(fullPath, opts);
   } catch {
     // eslint-disable-next-line no-console
-    console.log('Error creating auto version on publish.');
+    console.log(`Error creating auto version (${label}).`);
   }
 }
 
@@ -415,4 +305,61 @@ export function createTooltip(text, className) {
 export function createButton(className, type = 'button', attributes = {}) {
   const button = createElement('button', className, { type, ...attributes });
   return button;
+}
+
+export const getMetadata = (el) => {
+  if (!el) return {};
+  const metadata = {};
+  [...el.childNodes].forEach((row) => {
+    if (row.children) {
+      const key = row.children[0].textContent.trim().toLowerCase();
+      const content = row.children[1].textContent.trim().toLowerCase();
+      metadata[key] = content;
+    }
+  });
+  return metadata;
+};
+
+let daMdMap = null;
+export function initDaMetadata(map) {
+  daMdMap = map;
+}
+
+export function getDaMetadata(key) {
+  if (!daMdMap) return key ? null : {};
+  if (key) {
+    return daMdMap.get(key) || null;
+  }
+  return Object.fromEntries(daMdMap);
+}
+
+export function setDaMetadata(key, value) {
+  if (!daMdMap) return;
+  if (value === null || value === undefined) {
+    daMdMap.delete(key);
+  } else {
+    daMdMap.set(key, value);
+  }
+}
+
+export function getDiffLabels() {
+  return {
+    local: getDaMetadata('diff-label-local') || 'Local',
+    upstream: getDaMetadata('diff-label-upstream') || 'Upstream',
+  };
+}
+
+export function htmlToProse(html) {
+  const ydoc = new Y.Doc();
+  aem2doc(html, ydoc);
+
+  const schema = getSchema();
+  const pmDoc = yDocToProsemirror(schema, ydoc);
+  const serializer = DOMSerializer.fromSchema(schema);
+  const fragment = serializer.serializeFragment(pmDoc.content);
+
+  const dom = document.createElement('div');
+  dom.append(fragment);
+
+  return { dom, ydoc };
 }

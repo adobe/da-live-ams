@@ -10,19 +10,11 @@ import {
   deleteTable,
   InputRule,
   inputRules,
+  wrappingInputRule,
   yUndo,
   yRedo,
 } from 'da-y-wrapper';
-
-function isURL(text) {
-  try {
-    const url = new URL(text);
-    // Only consider https as valid URLs for auto-linking
-    return url.protocol === 'https:';
-  } catch (e) {
-    return false;
-  }
-}
+import { isURL } from '../../utils/helpers.js';
 
 export function getURLInputRule() {
   return new InputRule(
@@ -82,6 +74,15 @@ export function getURLInputRulesPlugin() {
   return inputRules({ rules: [getURLInputRule()] });
 }
 
+// Returns an inputRules plugin for auto-creating bullet and ordered lists
+export function getListInputRulesPlugin(schema) {
+  const rules = [
+    wrappingInputRule(/^\s*1[.)]\s$/, schema.nodes.ordered_list),
+    wrappingInputRule(/^\s*([-*])\s$/, schema.nodes.bullet_list),
+  ];
+  return inputRules({ rules });
+}
+
 const isRowSelected = (rect) => rect.left === 0 && rect.right === rect.map.width;
 
 const isColumnSelected = (rect) => rect.top === 0 && rect.bottom === rect.map.height;
@@ -125,7 +126,7 @@ export function handleTableTab(direction) {
   return (state, dispatch) => {
     if (!isInTable(state)) return false;
     const rect = selectedRect(state);
-    if (isCursorInLastTableCell(rect)) {
+    if (direction === 1 && isCursorInLastTableCell(rect)) {
       addRowAfter(state, dispatch);
       return gtnc(window.view.state, dispatch);
     }

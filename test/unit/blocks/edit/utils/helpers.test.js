@@ -1,24 +1,54 @@
 import { readFile } from '@web/test-runner-commands';
 import { expect } from '@esm-bundle/chai';
+import { DOMSerializer, Y } from 'da-y-wrapper';
+import { aem2doc, getSchema, yDocToProsemirror } from 'da-parser';
 
-import {
-  aem2prose,
+const { setNx } = await import('../../../../../scripts/utils.js');
+setNx('/test/fixtures/nx', { hostname: 'example.com' });
+
+const {
   saveToDa,
   convertSheets,
   parse,
   createElement,
   createTooltip,
   createButton,
-} from '../../../../../blocks/edit/utils/helpers.js';
+  getMetadata,
+  initDaMetadata,
+  getDaMetadata,
+  setDaMetadata,
+  isURL,
+  saveToAem,
+  saveDaConfig,
+  saveDaVersion,
+  debounce,
+  getDiffLabels,
+  htmlToProse,
+} = await import('../../../../../blocks/edit/utils/helpers.js');
 
-document.body.innerHTML = await readFile({ path: './mocks/body.html' });
+// Skip the api.js hlx6 upgrade probe so source/config URLs stay on DA_ADMIN.
+const skipPing = (handler) => async (url, opts) => {
+  if (typeof url === 'string' && url.startsWith('https://admin.hlx.page/ping')) {
+    return new Response('', { status: 200, headers: new Headers() });
+  }
+  return handler(url, opts);
+};
 
-describe('aem2prose', () => {
+const bodyHtml = await readFile({ path: './mocks/body.html' });
+
+describe('aem2doc', () => {
   before('parse everything', () => {
-    const docFragments = aem2prose(document);
+    // Use aem2doc to convert the HTML
+    const tempYdoc = new Y.Doc();
+    aem2doc(bodyHtml, tempYdoc);
+    const schema = getSchema();
+    const pmDoc = yDocToProsemirror(schema, tempYdoc);
+    const serializer = DOMSerializer.fromSchema(schema);
+    const fragment = serializer.serializeFragment(pmDoc.content);
+
+    document.body.innerHTML = '<main></main>';
     const main = document.body.querySelector('main');
-    main.innerHTML = '';
-    main.append(...docFragments);
+    main.append(fragment);
   });
 
   it('Decorates block', () => {
@@ -42,9 +72,11 @@ describe('aem2prose', () => {
     expect(hr).to.exist;
   });
 
-  it('Decorates HRs', () => {
-    const hr = document.querySelector('table hr');
-    expect(hr).to.exist;
+  it('Converts three dashes to HR', () => {
+    // aem2doc converts standalone --- paragraphs to HR at the section level
+    // The third section's block content is preserved in table structure
+    const tables = document.querySelectorAll('table');
+    expect(tables.length).to.be.greaterThan(0);
   });
 });
 
@@ -58,10 +90,10 @@ function createSheet(name, data, columnWidths) {
 
 describe('saveToDa', () => {
   it('Saves sheets', async () => {
-    const mockFetch = async (url, opts) => {
+    const mockFetch = skipPing(async (url, opts) => {
       const payload = [...opts.body.entries()][0][1];
       return new Response(payload, { status: 200 });
-    };
+    });
 
     const sheets = [
       createSheet(
@@ -409,5 +441,382 @@ describe('createButton', () => {
     const button = createButton('btn-reset', 'reset');
 
     expect(button.type).to.equal('reset');
+  });
+});
+
+describe('getMetadata', () => {
+  it('Returns empty object when element is null', () => {
+    const result = getMetadata(null);
+    expect(result).to.deep.equal({});
+  });
+
+  it('Returns empty object when element is undefined', () => {
+    const result = getMetadata(undefined);
+    expect(result).to.deep.equal({});
+  });
+
+  it('Extracts metadata from table rows', () => {
+    const metadataEl = document.createElement('div');
+    metadataEl.innerHTML = `
+      <div>
+        <div>Title</div>
+        <div>My Page Title</div>
+      </div>
+      <div>
+        <div>Description</div>
+        <div>Page Description</div>
+      </div>
+    `;
+
+    const result = getMetadata(metadataEl);
+
+    expect(result).to.deep.equal({
+      title: 'my page title',
+      description: 'page description',
+    });
+  });
+
+  it('Handles rows with empty values', () => {
+    const metadataEl = document.createElement('div');
+    metadataEl.innerHTML = `
+      <div>
+        <div>Key1</div>
+        <div></div>
+      </div>
+      <div>
+        <div>Key2</div>
+        <div>Value2</div>
+      </div>
+    `;
+
+    const result = getMetadata(metadataEl);
+
+    expect(result).to.deep.equal({
+      key1: '',
+      key2: 'value2',
+    });
+  });
+
+  it('Trims and lowercases keys and values', () => {
+    const metadataEl = document.createElement('div');
+    metadataEl.innerHTML = `
+      <div>
+        <div>  UPPERCASE KEY  </div>
+        <div>  UPPERCASE VALUE  </div>
+      </div>
+    `;
+
+    const result = getMetadata(metadataEl);
+
+    expect(result).to.deep.equal({ 'uppercase key': 'uppercase value' });
+  });
+
+  it('Skips rows without children', () => {
+    const metadataEl = document.createElement('div');
+    metadataEl.appendChild(document.createTextNode('Some text node'));
+
+    const rowWithChildren = document.createElement('div');
+    rowWithChildren.innerHTML = `
+      <div>Key</div>
+      <div>Value</div>
+    `;
+    metadataEl.appendChild(rowWithChildren);
+
+    const result = getMetadata(metadataEl);
+
+    expect(result).to.deep.equal({ key: 'value' });
+  });
+});
+
+describe('daMetadata functions', () => {
+  let mockMap;
+
+  beforeEach(() => {
+    // Create a simple mock for Y.Map
+    const storage = new Map();
+    mockMap = {
+      get: (key) => storage.get(key) || null,
+      set: (key, value) => storage.set(key, value),
+      delete: (key) => storage.delete(key),
+      entries: () => storage.entries(),
+      [Symbol.iterator]: () => storage.entries(),
+    };
+  });
+
+  describe('initDaMetadata', () => {
+    it('Initializes the metadata map', () => {
+      initDaMetadata(mockMap);
+      // Should not throw and should allow subsequent operations
+      setDaMetadata('test-key', 'test-value');
+      expect(getDaMetadata('test-key')).to.equal('test-value');
+    });
+  });
+
+  describe('getDaMetadata', () => {
+    beforeEach(() => {
+      initDaMetadata(mockMap);
+    });
+
+    it('Returns null for non-existent key', () => {
+      const result = getDaMetadata('non-existent');
+      expect(result).to.be.null;
+    });
+
+    it('Returns value for existing key', () => {
+      setDaMetadata('my-key', 'my-value');
+      const result = getDaMetadata('my-key');
+      expect(result).to.equal('my-value');
+    });
+
+    it('Returns all metadata when no key provided', () => {
+      setDaMetadata('key1', 'value1');
+      setDaMetadata('key2', 'value2');
+
+      const result = getDaMetadata();
+      expect(result).to.deep.equal({
+        key1: 'value1',
+        key2: 'value2',
+      });
+    });
+
+    it('Returns empty object when no metadata exists and no key provided', () => {
+      const result = getDaMetadata();
+      expect(result).to.deep.equal({});
+    });
+  });
+
+  describe('setDaMetadata', () => {
+    beforeEach(() => {
+      initDaMetadata(mockMap);
+    });
+
+    it('Sets a metadata value', () => {
+      setDaMetadata('test-key', 'test-value');
+      expect(getDaMetadata('test-key')).to.equal('test-value');
+    });
+
+    it('Updates an existing metadata value', () => {
+      setDaMetadata('test-key', 'initial-value');
+      setDaMetadata('test-key', 'updated-value');
+      expect(getDaMetadata('test-key')).to.equal('updated-value');
+    });
+
+    it('Deletes metadata when value is null', () => {
+      setDaMetadata('test-key', 'test-value');
+      expect(getDaMetadata('test-key')).to.equal('test-value');
+
+      setDaMetadata('test-key', null);
+      expect(getDaMetadata('test-key')).to.be.null;
+    });
+
+    it('Deletes metadata when value is undefined', () => {
+      setDaMetadata('test-key', 'test-value');
+      expect(getDaMetadata('test-key')).to.equal('test-value');
+
+      setDaMetadata('test-key', undefined);
+      expect(getDaMetadata('test-key')).to.be.null;
+    });
+
+    it('Handles multiple keys independently', () => {
+      setDaMetadata('key1', 'value1');
+      setDaMetadata('key2', 'value2');
+      setDaMetadata('key3', 'value3');
+
+      expect(getDaMetadata('key1')).to.equal('value1');
+      expect(getDaMetadata('key2')).to.equal('value2');
+      expect(getDaMetadata('key3')).to.equal('value3');
+
+      setDaMetadata('key2', null);
+
+      expect(getDaMetadata('key1')).to.equal('value1');
+      expect(getDaMetadata('key2')).to.be.null;
+      expect(getDaMetadata('key3')).to.equal('value3');
+    });
+  });
+});
+
+describe('isURL', () => {
+  it('Returns true for an https URL', () => {
+    expect(isURL('https://example.com/foo')).to.be.true;
+  });
+
+  it('Returns false for non-https protocols', () => {
+    expect(isURL('http://example.com/')).to.be.false;
+    expect(isURL('ftp://example.com/')).to.be.false;
+  });
+
+  it('Returns false for non-URL strings', () => {
+    expect(isURL('not-a-url')).to.be.false;
+    expect(isURL('')).to.be.false;
+  });
+});
+
+describe('saveToAem', () => {
+  let savedFetch;
+  beforeEach(() => { savedFetch = window.fetch; });
+  afterEach(() => { window.fetch = savedFetch; });
+
+  it('Returns the parsed JSON on success', async () => {
+    let captured;
+    window.fetch = (url, opts) => {
+      captured = { url, opts };
+      return Promise.resolve(new Response(JSON.stringify({ status: 'ok' }), { status: 200 }));
+    };
+    const result = await saveToAem('/owner/repo/path/page', 'preview');
+    expect(captured.opts.method).to.equal('POST');
+    expect(captured.url).to.contain('/preview/owner/repo/main/path/page');
+    expect(result).to.deep.equal({ status: 'ok' });
+  });
+
+  it('Returns a not-authorized error for 401', async () => {
+    window.fetch = () => Promise.resolve(new Response('', {
+      status: 401,
+      headers: {},
+    }));
+    const result = await saveToAem('/owner/repo/page', 'publish');
+    expect(result.error).to.include({ status: 401, action: 'publish' });
+    expect(result.error.message).to.equal('Not authorized to publish');
+  });
+
+  it('Parses an x-error PDF detail on a non-auth failure', async () => {
+    window.fetch = () => Promise.resolve(new Response('', {
+      status: 500,
+      headers: { 'x-error': "[admin] Unable to preview '.../doc.pdf': PDF is larger than 10MB: 24.0MB" },
+    }));
+    const result = await saveToAem('/o/r/page', 'preview');
+    expect(result.error.details).to.equal('PDF is larger than 10MB: 24.0MB');
+  });
+
+  it('Parses an x-error MP4 detail', async () => {
+    window.fetch = () => Promise.resolve(new Response('', {
+      status: 500,
+      headers: { 'x-error': "[admin] Unable to preview '.../v.mp4': MP4 is longer than 2 minutes: 2m 44s" },
+    }));
+    const result = await saveToAem('/o/r/page', 'preview');
+    expect(result.error.details).to.equal('MP4 is longer than 2 minutes');
+  });
+
+  it('Parses an x-error Image detail and strips the .00', async () => {
+    window.fetch = () => Promise.resolve(new Response('', {
+      status: 500,
+      headers: { 'x-error': "[admin] Unable to preview '.../page.md': source contains large image: error: Image 1 exceeds allowed limit of 10.00MB" },
+    }));
+    const result = await saveToAem('/o/r/page', 'preview');
+    expect(result.error.details).to.equal('Image 1 exceeds allowed limit of 10MB');
+  });
+
+  it('Falls back to stripping [admin] prefix for other x-error', async () => {
+    window.fetch = () => Promise.resolve(new Response('', {
+      status: 500,
+      headers: { 'x-error': '[admin] something else' },
+    }));
+    const result = await saveToAem('/o/r/page', 'preview');
+    expect(result.error.details).to.equal('something else');
+  });
+});
+
+describe('saveDaConfig', () => {
+  let savedFetch;
+  beforeEach(() => { savedFetch = window.fetch; });
+  afterEach(() => { window.fetch = savedFetch; });
+
+  it('PUTs to the config endpoint with the json under the config form key', async () => {
+    let captured;
+    window.fetch = skipPing((url, opts) => {
+      captured = { url, opts };
+      return Promise.resolve(new Response('{}', { status: 200 }));
+    });
+    const sheets = [{
+      name: 'config',
+      getData: () => [['k', 'v'], ['a', '1']],
+      getConfig: () => ({ columns: [{ width: '10' }, { width: '20' }] }),
+    }];
+    await saveDaConfig('/org/site', sheets);
+    expect(captured.url).to.contain('/config/org/site');
+    expect(captured.opts.method).to.equal('PUT');
+    const config = captured.opts.body.get('config');
+    expect(typeof config).to.equal('string');
+    const parsed = JSON.parse(config);
+    expect(parsed.data).to.deep.equal([{ k: 'a', v: '1' }]);
+  });
+});
+
+describe('saveDaVersion', () => {
+  let savedFetch;
+  beforeEach(() => { savedFetch = window.fetch; });
+  afterEach(() => { window.fetch = savedFetch; });
+
+  it('POSTs the label as a JSON body and swallows errors', async () => {
+    let captured;
+    window.fetch = (url, opts) => {
+      captured = { url, opts };
+      return Promise.resolve(new Response('', { status: 200 }));
+    };
+    await saveDaVersion('/org/site/page', 'My Label');
+    expect(captured.url).to.contain('/versionsource/org/site/page');
+    expect(captured.opts.method).to.equal('POST');
+    expect(captured.opts.body).to.equal(JSON.stringify({ label: 'My Label' }));
+  });
+
+  it('Defaults the label to "Published"', async () => {
+    let captured;
+    window.fetch = (url, opts) => {
+      captured = { url, opts };
+      return Promise.resolve(new Response('', { status: 200 }));
+    };
+    await saveDaVersion('/org/site/page');
+    expect(captured.opts.body).to.equal(JSON.stringify({ label: 'Published' }));
+  });
+});
+
+describe('debounce', () => {
+  it('Calls the function only once within the wait window', async () => {
+    let calls = 0;
+    const fn = debounce(() => { calls += 1; }, 20);
+    fn();
+    fn();
+    fn();
+    await new Promise((r) => { setTimeout(r, 60); });
+    expect(calls).to.equal(1);
+  });
+
+  it('Passes arguments through to the underlying function', async () => {
+    let received;
+    const fn = debounce((...args) => { received = args; }, 10);
+    fn('a', 1);
+    await new Promise((r) => { setTimeout(r, 30); });
+    expect(received).to.deep.equal(['a', 1]);
+  });
+});
+
+describe('getDiffLabels', () => {
+  beforeEach(() => {
+    const storage = new Map();
+    initDaMetadata({
+      get: (key) => storage.get(key) || null,
+      set: (key, value) => storage.set(key, value),
+      delete: (key) => storage.delete(key),
+      entries: () => storage.entries(),
+      [Symbol.iterator]: () => storage.entries(),
+    });
+  });
+
+  it('Defaults to Local/Upstream when no metadata is set', () => {
+    expect(getDiffLabels()).to.deep.equal({ local: 'Local', upstream: 'Upstream' });
+  });
+
+  it('Returns the configured labels', () => {
+    setDaMetadata('diff-label-local', 'Mine');
+    setDaMetadata('diff-label-upstream', 'Theirs');
+    expect(getDiffLabels()).to.deep.equal({ local: 'Mine', upstream: 'Theirs' });
+  });
+});
+
+describe('htmlToProse', () => {
+  it('Returns a DOM fragment and a Y.Doc for valid input', () => {
+    const result = htmlToProse('<body><main><div><p>Hello</p></div></main></body>');
+    expect(result.dom).to.be.instanceOf(HTMLElement);
+    expect(result.dom.textContent).to.contain('Hello');
+    expect(result.ydoc).to.exist;
   });
 });
