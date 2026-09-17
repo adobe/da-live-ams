@@ -4,8 +4,8 @@ AMS fork of the da.live application, adapted for FedRAMP/GovCloud deployment.
 
 ## Context
 
-@/Users/schmidt/Documents/git/eds_tools/ams-eds-terraform/.cursor/rules/da-live-govcloud-migration-overview.md
-@/Users/schmidt/Documents/git/eds_tools/ams-eds-terraform/.cursor/rules/development-standards-shared.md
+@../../eds_tools/ams-eds-terraform/.cursor/rules/da-live-govcloud-migration-overview.md
+@../../eds_tools/ams-eds-terraform/.cursor/rules/development-standards-shared.md
 
 ## What This Is
 
