@@ -81,6 +81,13 @@ export default async function loadPage() {
   }
 
   await loadArea();
+
+  // Persistent, page-level name/email label next to nx-nav's own sign-in/sign-out affordance
+  // — see da-auth-status.js for why this exists instead of relying solely on nx-profile's own
+  // (dropdown-only) display name. Mounted after loadArea() so nx-nav (if this page has one) is
+  // actually in the DOM to measure a position from, not guessed ahead of it.
+  const { mountAuthStatus } = await import('../blocks/shared/da-auth-status/da-auth-status.js');
+  mountAuthStatus();
 }
 
 loadPage();

@@ -1,30 +1,24 @@
-import { getNx } from '../../../scripts/utils.js';
+import { signIn } from '../utils.js';
 import '../da-dialog/da-dialog.js';
 
 let mountedInstance = null;
 
-async function triggerSignIn() {
-  const { loadIms, handleSignIn } = await import(`${getNx()}/utils/ims.js`);
-  await loadIms();
-  handleSignIn();
-}
-
-export function showAuthBanner() {
+export function showAuthBanner(hasExistingSession = true) {
   if (mountedInstance?.isConnected) return mountedInstance;
 
   const dialog = document.createElement('da-dialog');
-  dialog.title = 'Your session has expired';
+  dialog.title = hasExistingSession ? 'Your session has expired' : 'Sign in required';
   dialog.classList.add('da-auth-banner');
   dialog.showCloseButton = false;
 
   const msg = document.createElement('p');
-  msg.textContent = 'Sign in again to continue.';
+  msg.textContent = hasExistingSession ? 'Sign in again to continue.' : 'Sign in to continue.';
   dialog.appendChild(msg);
 
   dialog.action = {
     label: 'Sign in',
     style: 'accent',
-    click: triggerSignIn,
+    click: signIn,
   };
 
   dialog.addEventListener('close', () => {

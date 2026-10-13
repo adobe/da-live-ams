@@ -15,8 +15,11 @@ import {
   sanitizeName,
   fetchDaConfigs,
   getAuthToken,
+  initIms,
   isValidHref,
 } from '../../../../blocks/shared/utils.js';
+import { testState as altAuthState } from '../../../fixtures/nx/utils/helix-admin-auth.js';
+import { testState as nx2ApiTestState } from '../../../fixtures/nx2/utils/api.js';
 
 // daFetch's 401-no-token path lazy-loads the banner module, which resolves
 // `${getNx()}/utils/utils.js`. Configure nx for the test environment so that
@@ -188,6 +191,30 @@ describe('sanitizeName', () => {
   });
 });
 
+// initIms() memoizes its result at module scope for the lifetime of this file's module
+// instance — a cache-busted re-import doesn't give a clean slate here, because it also
+// re-instantiates scripts/utils.js, losing the setNx() config set up above (confirmed
+// empirically: getNx() reads back undefined inside a freshly re-imported utils.js). So this
+// file gets exactly one real, ordered look at initIms(): the alternate-provider path, since
+// that's the new code being added. The complementary "no alternate idp configured" path
+// needs its own module graph and lives in utils-init-ims-fallback.test.js instead.
+describe('initIms', () => {
+  before(() => {
+    window.localStorage.removeItem('nx-ims');
+    altAuthState.available = true;
+    altAuthState.token = 'hlxtst_abc.def.ghi';
+  });
+
+  it('uses the alternate provider when it is available', async () => {
+    expect(await initIms()).to.deep.equal({ accessToken: { token: 'hlxtst_abc.def.ghi' } });
+  });
+
+  it('memoizes — a later call ignores changed state and returns the cached result', async () => {
+    altAuthState.token = 'hlxtst_should.not.be.seen';
+    expect(await initIms()).to.deep.equal({ accessToken: { token: 'hlxtst_abc.def.ghi' } });
+  });
+});
+
 describe('getAuthToken', () => {
   let savedAdobeIMS;
 
@@ -233,6 +260,16 @@ describe('getAuthToken', () => {
     window.localStorage.setItem('nx-ims', 'true');
     window.adobeIMS = { getAccessToken: () => null };
     expect(await getAuthToken()).to.be.null;
+  });
+
+  it('Falls back through initIms() for the alternate provider (no window.adobeIMS)', async () => {
+    // The alternate provider never sets window.adobeIMS, so this only reaches initIms() if
+    // nx-ims is set — which is exactly the gap fixed by having that provider's storeToken()
+    // set nx-ims the same way ims.js does. Relies on the 'initIms' describe block above
+    // having already primed the shared initIms() singleton with the alt provider, signed in
+    // (module-level memoization means this file only gets one real initIms() outcome).
+    window.localStorage.setItem('nx-ims', 'true');
+    expect(await getAuthToken()).to.equal('hlxtst_abc.def.ghi');
   });
 });
 
@@ -365,6 +402,91 @@ describe('daFetch', () => {
 
     const resp = await daFetch('https://example.com/test');
     expect(resp.status).to.equal(403);
+  });
+
+  it('For the alt provider with org/site known, sends the site-scoped token on the first request', async () => {
+    // initIms() (see the 'initIms' describe block above) is already memoized in this file to
+    // the alt provider, signed in as 'hlxtst_abc.def.ghi' — the account-level token; the exchange
+    // (mocked via the nx2 api fixture's testState) supplies the site-scoped one.
+    window.localStorage.setItem('nx-ims', 'true');
+    nx2ApiTestState.siteToken = 'hlxtst_site.scoped.token';
+
+    let fetchCalls = 0;
+    const capturedAuth = [];
+    window.fetch = (url, opts) => {
+      fetchCalls += 1;
+      capturedAuth.push(opts?.headers?.Authorization);
+      return Promise.resolve(new Response('ok', { status: 200 }));
+    };
+
+    const resp = await daFetch(
+      'http://localhost:8787/source/o/r/p.html',
+      {},
+      { org: 'myorg', site: 'mysite' },
+    );
+
+    expect(resp.ok).to.equal(true);
+    expect(fetchCalls).to.equal(1);
+    expect(capturedAuth).to.deep.equal(['Bearer hlxtst_site.scoped.token']);
+  });
+
+  it('Derives org/site from the URL and sends the site-scoped token when the caller '
+    + 'does not pass them explicitly', async () => {
+    // Regression test: callers like ew-editor-doc/utils/source.js's checkDoc() call daFetch
+    // without a third {org, site} argument at all, so the exchange must not depend on it.
+    window.localStorage.setItem('nx-ims', 'true');
+    nx2ApiTestState.siteToken = 'hlxtst_site.scoped.token';
+
+    let fetchCalls = 0;
+    const capturedAuth = [];
+    window.fetch = (url, opts) => {
+      fetchCalls += 1;
+      capturedAuth.push(opts?.headers?.Authorization);
+      return Promise.resolve(new Response('ok', { status: 200 }));
+    };
+
+    const resp = await daFetch('http://localhost:8787/source/o/r/p.html');
+
+    expect(resp.ok).to.equal(true);
+    expect(fetchCalls).to.equal(1);
+    expect(capturedAuth).to.deep.equal(['Bearer hlxtst_site.scoped.token']);
+  });
+
+  it('Falls back to the account-level token when the site-token exchange yields none', async () => {
+    window.localStorage.setItem('nx-ims', 'true');
+    nx2ApiTestState.siteToken = null;
+
+    const capturedAuth = [];
+    window.fetch = (url, opts) => {
+      capturedAuth.push(opts?.headers?.Authorization);
+      return Promise.resolve(new Response('ok', { status: 200 }));
+    };
+
+    const resp = await daFetch('http://localhost:8787/source/o/r/p.html');
+
+    expect(resp.ok).to.equal(true);
+    expect(capturedAuth).to.deep.equal(['Bearer hlxtst_abc.def.ghi']);
+  });
+
+  it('Does not attempt the site-token exchange when org/site are not passed and cannot be '
+    + 'parsed from the URL', async () => {
+    window.localStorage.setItem('nx-ims', 'true');
+    nx2ApiTestState.siteToken = 'hlxtst_site.scoped.token';
+
+    let fetchCalls = 0;
+    window.fetch = () => {
+      fetchCalls += 1;
+      return Promise.resolve(new Response('nope', { status: 401 }));
+    };
+
+    // noRedirect: true — otherwise this hits the existing "already have a token but still
+    // 401" path, a real window.location navigation unrelated to what this test checks.
+    // Only one path segment (no site) after the origin, so parseOrgSiteFromUrl can't derive
+    // a site either.
+    const resp = await daFetch('http://localhost:8787/ping', { noRedirect: true });
+
+    expect(resp.status).to.equal(401);
+    expect(fetchCalls).to.equal(1);
   });
 });
 

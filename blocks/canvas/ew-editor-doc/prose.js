@@ -38,8 +38,8 @@ import imageFocalPoint from '../../edit/prose/plugins/imageFocalPoint.js';
 import sectionPasteHandler from '../../edit/prose/plugins/sectionPasteHandler.js';
 import base64Uploader from './prose-plugins/base64Uploader.js';
 import blockFocus, { guardFocusedBlockDeletion } from './prose-plugins/blockFocus.js';
-import { getNx } from '../../../scripts/utils.js';
-import { getAuthToken } from '../../shared/utils.js';
+import { getNx, getNx2Api } from '../../../scripts/utils.js';
+import { getAuthToken, initIms, resolveAuthModule } from '../../shared/utils.js';
 import { generateColor, getCollabIdentity } from './utils/collab.js';
 import { checkBlockLibraryConfigured } from '../editor-utils/block-slash.js';
 import { canvasBus } from '../utils/canvas-bus.js';
@@ -82,6 +82,18 @@ function checkLibraryConfiguredOnSync(wsProvider, canWrite) {
   wsProvider.on('synced', handleSynced);
 }
 
+// Source URLs are `{DA_ADMIN}/source/{org}/{site}/...` (da-admin) or
+// `{AEM_API}/{org}/sites/{site}/source/...` (hlx6 sites).
+function parseOrgSite(path) {
+  try {
+    const parts = new URL(path).pathname.split('/').filter(Boolean);
+    if (parts[1] === 'sites') return { org: parts[0], site: parts[2] };
+    return { org: parts[1], site: parts[2] };
+  } catch {
+    return {};
+  }
+}
+
 export default async function initProse({
   path, permissions, setEditable, getToken,
   extraPlugins = [],
@@ -97,6 +109,7 @@ export default async function initProse({
   const server = DA_COLLAB;
   // da-collab reads the store off the room name, and `path` is already the store's source url.
   const roomName = path;
+  const { org, site } = parseOrgSite(path);
 
   const wsOpts = { protocols: ['yjs'] };
   let lastSentToken = null;
@@ -121,11 +134,27 @@ export default async function initProse({
     }
     if (event?.code === 4401) {
       try { await window.adobeIMS?.refreshToken?.(); } catch { /* ignore */ }
-      const fresh = await getAuthToken();
+      let fresh = await getAuthToken();
+      if ((!fresh || fresh === lastSentToken) && org && site) {
+        // getAuthToken() only ever returns initIms()'s memoized, page-load-time token — it
+        // never learns about a site-scoped token minted later by daFetch's own upgrade (see
+        // shared/utils.js). Without this, a connection opened with the alt provider's
+        // account-level token 4401s here forever even though a working site token exists.
+        const { useAlt } = await resolveAuthModule();
+        if (useAlt) {
+          const { getAemSiteToken } = await getNx2Api();
+          const { siteToken } = await getAemSiteToken({ org, site });
+          if (siteToken) fresh = siteToken;
+        }
+      }
       if (!fresh || fresh === lastSentToken) {
         wsProvider.shouldConnect = false;
         if (lastSentToken) {
           try {
+            // Guarantees isAvailable()/loadIms() have resolved before the banner's button can
+            // be clicked — this WS disconnect can fire before loadPage()'s own initIms() call
+            // has settled (see the identical fix in shared/utils.js's daFetch()).
+            await initIms();
             const { showAuthBanner } = await import('../../shared/da-auth-banner/da-auth-banner.js');
             showAuthBanner();
           } catch { /* ignore */ }
