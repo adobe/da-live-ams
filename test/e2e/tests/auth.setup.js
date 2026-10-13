@@ -33,6 +33,12 @@ The configuration in https://da.live/config#/da-testautomation/ should be as fol
   /acltest/testdocs/subdir/subdir2/subdir3 907136ED5D35CBF50A495CD4 read
   /acltest/testdocs/dir-readwrite/+** 907136ED5D35CBF50A495CD4/DA-Test write
   /acltest/testdocs/dir-readonly/+** 907136ED5D35CBF50A495CD4/DA-Test read
+
+`/acltest/otherdir` must NOT have any rule on it or any descendant (no row
+above should match it or anything below it). It is used to verify that a
+folder with no permitted descendant anywhere is still blocked with 403,
+now that adobe/da-admin#299 lets ancestors of a permitted path (like
+`testdocs` above) list successfully.
 */
 
 // This is executed once to authenticate the user used during the tests.
@@ -78,7 +84,7 @@ setup('Set up authentication', async ({ page }) => {
   await continueButton.waitFor();
   await continueButton.click();
 
-  const passwordInput = page.getByLabel('Password', { exact: true });
+  const passwordInput = page.getByLabel(/^(continue with )?password$/i);
   await passwordInput.waitFor();
   await passwordInput.evaluate((el, password) => {
     const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
@@ -93,9 +99,9 @@ setup('Set up authentication', async ({ page }) => {
   await foundationInternal.waitFor();
   await foundationInternal.click();
 
-  const authorLink = page.locator('a.nx-nav-brand');
+  const authorLink = page.locator('a.brand-area');
   await authorLink.waitFor();
-  await expect(authorLink).toContainText('Author');
+  await expect(authorLink).toBeVisible();
 
   await page.context().storageState({ path: AUTH_FILE });
 });

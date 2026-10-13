@@ -1,20 +1,29 @@
 import { LitElement, html, nothing } from 'da-lit';
 import { getNx } from '../../../scripts/utils.js';
+import {
+  persistToolPanelView,
+  resolveInitialToolPanelView,
+} from '../utils/panel.js';
 
 const { loadStyle } = await import(`${getNx()}/utils/utils.js`);
+const { PANEL_EVENT } = await import(`${getNx()}/utils/panel.js`);
 
 await import(`${getNx()}/blocks/shared/picker/picker.js`);
 
-const style = await loadStyle(import.meta.url);
+const [base, style] = await Promise.all([
+  loadStyle(new URL('../../shared/styles/base.css', import.meta.url).href),
+  loadStyle(import.meta.url),
+]);
 
 const CLOSE_ICON_SRC = '/img/icons/s2-icon-splitright-20-n.svg';
 const OPEN_IN_ICON_URL = '/img/icons/s2-icon-openin-20-n.svg';
-const ACTIVE_VIEW_KEY = 'nx-tool-panel-active-view';
 
 class EwToolPanel extends LitElement {
   static properties = {
     views: { attribute: false },
     activeId: { type: String },
+    org: { type: String },
+    site: { type: String },
     _fullsizeDialogViewId: { state: true },
   };
 
@@ -22,7 +31,7 @@ class EwToolPanel extends LitElement {
 
   connectedCallback() {
     super.connectedCallback();
-    this.shadowRoot.adoptedStyleSheets = [style];
+    this.shadowRoot.adoptedStyleSheets = [base, style];
   }
 
   get _fullsizeDialogView() {
@@ -40,7 +49,8 @@ class EwToolPanel extends LitElement {
         items.push({ section: v.section });
         lastSection = v.section;
       }
-      const opensExternally = v.experience === 'window' || v.experience === 'fullsize-dialog';
+      const opensExternally = v.experience === 'window' || v.experience === 'fullsize-dialog'
+        || v.experience === 'modal';
       items.push({
         value: v.id,
         label: v.label,
@@ -69,9 +79,7 @@ class EwToolPanel extends LitElement {
   async updated(changed) {
     if (changed.has('views')) await this._onViewsChange();
     if (changed.has('activeId')) {
-      if (this.activeId) {
-        try { sessionStorage.setItem(ACTIVE_VIEW_KEY, this.activeId); } catch { /* ignore */ }
-      }
+      if (this.activeId) persistToolPanelView(this.activeId);
       this._syncContent();
       this._syncHeaderActions();
     }
@@ -97,8 +105,12 @@ class EwToolPanel extends LitElement {
     }
 
     if (!this.activeId || !ids.has(this.activeId)) {
-      const stored = sessionStorage.getItem(ACTIVE_VIEW_KEY);
-      await this.showView(stored && ids.has(stored) ? stored : this.views[0].id);
+      const initial = await resolveInitialToolPanelView({
+        org: this.org,
+        site: this.site,
+        availableIds: ids,
+      });
+      await this.showPanel(initial ?? this.views[0].id);
     }
   }
 
@@ -124,8 +136,8 @@ class EwToolPanel extends LitElement {
     }
   }
 
-  async showView(id) {
-    const consumer = this.views.find((c) => c.id === id);
+  async showPanel(name) {
+    const consumer = this.views.find((c) => c.id === name);
     if (!consumer) return;
     if (consumer.experience === 'window') {
       window.open(
@@ -136,13 +148,17 @@ class EwToolPanel extends LitElement {
       return;
     }
     if (consumer.experience === 'fullsize-dialog') {
-      this._fullsizeDialogViewId = id;
+      this._fullsizeDialogViewId = name;
       return;
     }
-    if (!this._loaded[id]) {
-      this._loaded[id] = await consumer.load();
+    if (consumer.experience === 'modal') {
+      await consumer.openModal?.();
+      return;
     }
-    this.activeId = id;
+    if (!this._loaded[name]) {
+      this._loaded[name] = await consumer.load();
+    }
+    this.activeId = name;
   }
 
   _syncContent() {
@@ -169,7 +185,9 @@ class EwToolPanel extends LitElement {
   }
 
   _close() {
-    this.dispatchEvent(new CustomEvent('nx-panel-close', { bubbles: true, composed: true }));
+    this.dispatchEvent(
+      new CustomEvent(PANEL_EVENT.CLOSE, { bubbles: true, composed: true }),
+    );
   }
 
   _onFullsizeDialogClose() {
@@ -190,7 +208,7 @@ class EwToolPanel extends LitElement {
           .items=${items}
           .value=${this.activeId}
           placement="below-start"
-          @change=${(e) => this.showView(e.detail.value)}
+          @change=${(e) => this.showPanel(e.detail.value)}
         ></nx-picker>
         <div class="tool-panel-header-actions"></div>
       </div>

@@ -1,7 +1,8 @@
 import { LitElement, html, nothing } from 'da-lit';
-import { DA_ORIGIN } from '../constants.js';
-import { daFetch, formatDate } from '../utils.js';
-import { formatVersions } from './helpers.js';
+import { formatDate } from '../utils.js';
+import { getNx2Api } from '../../../scripts/utils.js';
+import { formatVersions, formatUser } from './helpers.js';
+import { getVersionId } from './version-actions.js';
 
 export default class DaVersionsBase extends LitElement {
   static properties = {
@@ -16,7 +17,8 @@ export default class DaVersionsBase extends LitElement {
     if (!this.path) return;
     this._loading = true;
     this._versions = null;
-    const resp = await daFetch(`${DA_ORIGIN}/versionlist${this.path}`);
+    const { versions } = await getNx2Api();
+    const resp = await versions.list(this.path);
     if (!resp.ok) {
       this._loading = false;
       return;
@@ -35,13 +37,18 @@ export default class DaVersionsBase extends LitElement {
     this.dispatchEvent(new CustomEvent('close', opts));
   }
 
-  async handlePreview(e, entry) {
+  handlePreview(e, entry) {
     e.stopPropagation();
     const entryEl = e.target.closest('.da-version-entry');
     if (!entryEl.classList.contains('is-open')) {
       entryEl.classList.toggle('is-open');
     }
-    const detail = { url: `${DA_ORIGIN}${entry.url}`, label: entry.label, date: entry.date };
+    // A version is always a version of the open doc, so restore only needs the
+    // version id — org/site/path come from the doc on the consumer side, which
+    // lets the fetch go through api.js's versions.get for both backends. hlx5's
+    // id is the /versionsource tail; hlx6's is the entry's ULID.
+    const versionId = getVersionId(this.path, entry);
+    const detail = { versionId, label: entry.label, date: entry.date };
     this.dispatchEvent(new CustomEvent('preview', { detail, bubbles: true, composed: true }));
   }
 
@@ -54,10 +61,8 @@ export default class DaVersionsBase extends LitElement {
     const entry = { ...this._newVersion };
     if (e.target.elements.label?.value) entry.label = e.target.elements.label.value;
 
-    const opts = { method: 'POST' };
-    if (entry.label) opts.body = JSON.stringify({ label: entry.label });
-
-    const res = await daFetch(`${DA_ORIGIN}/versionsource${this.path}`, opts);
+    const { versions } = await getNx2Api();
+    const res = await versions.create(this.path, entry.label ? { comment: entry.label } : {});
     if (res.status !== 201) return;
 
     this._newVersion = null;
@@ -93,7 +98,7 @@ export default class DaVersionsBase extends LitElement {
             <li class="da-version-audit-entry">
               <p class="da-version-time">${auEntry.time}</p>
               <div class="da-audit-names">
-              ${auEntry.users.map((user) => html`<p>${user.email}</p>`)}
+              ${auEntry.users.map((user) => html`<p>${formatUser(user)}</p>`)}
               </div>
             </li>
           `)}
@@ -126,7 +131,7 @@ export default class DaVersionsBase extends LitElement {
           <li class="da-version-audit-entry">
             <p class="da-version-time">${entry.time}</p>
             <div class="da-audit-names">
-            ${entry.users.map((user) => html`<p>${user.email}</p>`)}
+            ${entry.users.map((user) => html`<p>${formatUser(user)}</p>`)}
             </div>
           </li>
         </ul>

@@ -1,11 +1,11 @@
-import { TextSelection, yUndo, yRedo } from 'da-y-wrapper';
+import { TextSelection, NodeSelection, yUndo, yRedo } from 'da-y-wrapper';
 import {
   getSelectionToolbar,
+  canShowSelectionToolbar,
   NX_QUICK_EDIT_IFRAME_SELECTION_META,
   NX_QUICK_EDIT_CLEAR_IFRAME_SELECTION_ORIGIN_META,
 } from '../../editor-utils/selection-toolbar.js';
-import { editorSelectChange } from '../../editor-utils/editor-utils.js';
-import { getActiveBlockIndex } from '../../editor-utils/blocks.js';
+import { canvasBus } from '../../utils/canvas-bus.js';
 
 export function handleCursorMove({ cursorOffset, textCursorOffset }, ctx) {
   const { view, wsProvider } = ctx;
@@ -58,17 +58,15 @@ export function handleCursorMove({ cursorOffset, textCursorOffset }, ctx) {
     }
 
     ctx.suppressRerender = true;
+    // dispatch() already triggers createTrackingPlugin's hook, which emits
+    // canvasBus.editorSelectState with the full payload (incl. proseIndex) — a second,
+    // blockIndex-only emit here would clobber that and collapse the outline.
     view.dispatch(tr.scrollIntoView());
     ctx.suppressRerender = false;
     const tb = getSelectionToolbar();
-    if (!tb.linkDialogOpen && !tb.isInteracting) {
+    if (canShowSelectionToolbar() && !tb.linkDialogOpen && !tb.isInteracting) {
       tb.view = view;
       tb.show();
-    }
-    const blockIndex = getActiveBlockIndex(view);
-    if (blockIndex !== ctx.lastBlockIndex) {
-      ctx.lastBlockIndex = blockIndex;
-      editorSelectChange.emit({ blockIndex, source: 'wysiwyg' });
     }
   } catch (error) {
     // eslint-disable-next-line no-console
@@ -95,6 +93,10 @@ export function handleUndoRedo(data, ctx) {
   if (hadHasFocus) view.hasFocus = () => true;
 }
 
+export function handleNewVersion() {
+  canvasBus.newVersionRequest.emit();
+}
+
 export function handleStoredMarks({ marks }, ctx) {
   const { view } = ctx;
   if (!view) return;
@@ -112,6 +114,8 @@ export function handleStoredMarks({ marks }, ctx) {
     ctx.suppressRerender = true;
     view.dispatch(tr);
     ctx.suppressRerender = false;
+    const tb = getSelectionToolbar();
+    if (tb.open && !tb.isInteracting) tb.requestUpdate();
   } catch (e) {
     // eslint-disable-next-line no-console
     console.error('[quick-edit-controller] handleStoredMarks failed', e?.message);
@@ -140,6 +144,7 @@ export function handleSelectionChange({ anchor, head }, ctx, { fromQuickEditIfra
 }
 
 function showToolbarInIFrame(ctx) {
+  if (!canShowSelectionToolbar()) return;
   const { view } = ctx;
   const tb = getSelectionToolbar();
   tb.view = view;
@@ -167,4 +172,82 @@ export function handleIframeSelectionChange(data, ctx) {
   if (!handleSelectionChange(data, ctx, { fromQuickEditIframe: true })) return;
 
   showToolbarInIFrame(ctx);
+}
+
+function srcFileName(src) {
+  if (!src) return '';
+  const bare = String(src).split('?')[0].split('#')[0];
+  return bare.split('/').pop() || '';
+}
+
+function findImagePosBySrc(doc, src, blockIndex) {
+  const name = srcFileName(src);
+  if (!name) return null;
+  let from = 0;
+  let to = doc.content.size;
+  if (blockIndex != null) {
+    const tablePos = blockIndex - 1;
+    const table = tablePos >= 0 ? doc.nodeAt(tablePos) : null;
+    if (table?.type.name === 'table') {
+      from = tablePos;
+      to = tablePos + table.nodeSize;
+    }
+  }
+  let found = null;
+  doc.nodesBetween(from, to, (n, pos) => {
+    if (found != null) return false;
+    if (n.type.name === 'image' && srcFileName(n.attrs?.src) === name) {
+      found = pos;
+      return false;
+    }
+    return true;
+  });
+  return found;
+}
+
+export function resolveNodeSelectPos(node, doc) {
+  if (!node) return null;
+  if (node.anchorType === 'table') {
+    const pos = node.proseIndex - 1;
+    if (pos < 0 || pos > doc.content.size) return null;
+    return doc.nodeAt(pos)?.type.name === 'table' ? pos : null;
+  }
+  if (node.anchorType === 'image') {
+    const pos = node.proseIndex;
+    if (pos != null && pos >= 0 && pos <= doc.content.size
+      && doc.nodeAt(pos)?.type.name === 'image') {
+      return pos;
+    }
+    return node.src ? findImagePosBySrc(doc, node.src, node.blockIndex) : null;
+  }
+  return null;
+}
+
+export function handleNodeSelect({ node }, ctx) {
+  const { view } = ctx;
+  if (!view) return;
+  const { state } = view;
+  try {
+    if (!node) {
+      const tr = state.tr
+        .setSelection(TextSelection.near(state.doc.resolve(state.selection.from), 1))
+        .setMeta('addToHistory', false);
+      ctx.suppressRerender = true;
+      view.dispatch(tr);
+      ctx.suppressRerender = false;
+      return;
+    }
+    const pos = resolveNodeSelectPos(node, state.doc);
+    if (pos == null) return;
+    const tr = state.tr
+      .setSelection(NodeSelection.create(state.doc, pos))
+      .scrollIntoView()
+      .setMeta('addToHistory', false);
+    ctx.suppressRerender = true;
+    view.dispatch(tr);
+    ctx.suppressRerender = false;
+  } catch (e) {
+    // eslint-disable-next-line no-console
+    console.error('[quick-edit-controller] handleNodeSelect failed', e?.message);
+  }
 }

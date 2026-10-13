@@ -1,8 +1,10 @@
 import { LitElement, html } from 'da-lit';
 import { getNx } from '../../../scripts/utils.js';
-import { getPreviewOrigin, fetchWysiwygCookie } from '../editor-utils/editor-utils.js';
+import { getPreviewOrigin, fetchWysiwygCookie, fetchWysiwygBranch } from '../editor-utils/editor-utils.js';
 import { initIms as loadIms } from '../../shared/utils.js';
 import { hideSelectionToolbar } from '../editor-utils/selection-toolbar.js';
+import { MESSAGE_TYPES } from '../utils/quick-edit-messages.js';
+import { canvasBus } from '../utils/canvas-bus.js';
 
 const { loadStyle } = await import(`${getNx()}/utils/utils.js`);
 
@@ -13,23 +15,26 @@ const QUICK_EDIT_INIT_MAX_ATTEMPTS = 25;
 
 const WYSIWYG_PORT_READY_ATTR = 'data-nx-wysiwyg-port-ready';
 
-function buildQuickEditInitPayload({ org, repo, path }) {
+function buildQuickEditInitPayload({ org, repo, path, branch = 'main', canWrite = false }) {
   const pathWithoutOrgRepo = path.split('/').slice(2).join('/');
   const pathname = pathWithoutOrgRepo ? `/${pathWithoutOrgRepo}` : '/';
   return {
-    config: { mountpoint: `${getPreviewOrigin(org, repo)}/${org}/${repo}` },
+    config: {
+      mountpoint: `${getPreviewOrigin(org, repo, branch)}/${org}/${repo}`,
+      canWrite,
+    },
     location: { pathname },
   };
 }
 
-async function tryLoadWysiwygPreviewCookies({ org, repo, path, getCurrentCtx }) {
+async function tryLoadWysiwygPreviewCookies({ org, repo, path, branch, getCurrentCtx }) {
   try {
     const token = (await loadIms())?.accessToken?.token;
     if (!token) {
       // eslint-disable-next-line no-console
       console.warn('[ew-editor-wysiwyg] Preview cookies: no auth token, proceeding without cookies');
     } else {
-      await fetchWysiwygCookie({ org, repo, token }).catch((e) => {
+      await fetchWysiwygCookie({ org, repo, token, branch }).catch((e) => {
         // eslint-disable-next-line no-console
         console.warn('[ew-editor-wysiwyg] Preview cookies failed, proceeding without cookies', e);
       });
@@ -45,22 +50,22 @@ async function tryLoadWysiwygPreviewCookies({ org, repo, path, getCurrentCtx }) 
 export class EwEditorWysiwyg extends LitElement {
   static properties = {
     ctx: { type: Object },
+    canWrite: { type: Boolean },
     _cookieReady: { state: true },
   };
 
   connectedCallback() {
     super.connectedCallback();
     this.shadowRoot.adoptedStyleSheets = [style];
-    this._onCanvasEditorActive = (e) => {
-      this._canvasActiveView = e.detail?.view;
+    this._unsubscribeEditorActive = canvasBus.editorViewState.subscribe(({ view }) => {
+      this._canvasActiveView = view;
       this._syncCanvasVisibility();
-    };
-    this.parentElement?.addEventListener('nx-canvas-editor-active', this._onCanvasEditorActive);
+    });
     this._syncCanvasVisibility();
   }
 
   disconnectedCallback() {
-    this.parentElement?.removeEventListener('nx-canvas-editor-active', this._onCanvasEditorActive);
+    this._unsubscribeEditorActive?.();
     this._clearQuickEditRetry();
     super.disconnectedCallback();
   }
@@ -72,7 +77,7 @@ export class EwEditorWysiwyg extends LitElement {
     const pathWithoutOrgRepo = segments.slice(2).join('/');
     const encodedPath = pathWithoutOrgRepo.split('/').map(encodeURIComponent).join('/');
     const quickEdit = new URLSearchParams(window.location.search).get('quick-edit') || 'on';
-    const base = `${getPreviewOrigin(org, repo)}/${encodedPath}?quick-edit=${encodeURIComponent(quickEdit)}`;
+    const base = `${getPreviewOrigin(org, repo, this._wysiwygBranch ?? 'main')}/${encodedPath}?quick-edit=${encodeURIComponent(quickEdit)}`;
     return `${base}&controller=parent`;
   }
 
@@ -116,11 +121,15 @@ export class EwEditorWysiwyg extends LitElement {
     const { org, repo, path } = this.ctx ?? {};
     if (!org || !repo || !path) return;
 
-    tryLoadWysiwygPreviewCookies({
-      org,
-      repo,
-      path,
-      getCurrentCtx: () => this.ctx,
+    fetchWysiwygBranch({ org, site: repo, path }).then((branch) => {
+      this._wysiwygBranch = branch;
+      return tryLoadWysiwygPreviewCookies({
+        org,
+        repo,
+        path,
+        branch,
+        getCurrentCtx: () => this.ctx,
+      });
     }).then((ok) => {
       if (!ok) return;
       this._cookieReady = true;
@@ -133,11 +142,7 @@ export class EwEditorWysiwyg extends LitElement {
     this.setAttribute(WYSIWYG_PORT_READY_ATTR, '');
     this._syncCanvasVisibility();
     const iframe = this.shadowRoot?.querySelector('iframe');
-    this.dispatchEvent(new CustomEvent('nx-wysiwyg-port-ready', {
-      bubbles: true,
-      composed: true,
-      detail: { port, iframe },
-    }));
+    canvasBus.wysiwygPortReady.emit({ port, iframe });
   }
 
   _scheduleQuickEditInitRetries(send) {
@@ -157,13 +162,21 @@ export class EwEditorWysiwyg extends LitElement {
     const { port1, port2 } = new MessageChannel();
     this._quickEditLocalPort = port1;
     port1.onmessage = (ev) => {
-      if (ev.data?.ready !== true) return;
+      // @deprecated flat `ready` — prefer `type === MESSAGE_TYPES.READY` (da-nx now sends both).
+      const isReady = ev.data?.type === MESSAGE_TYPES.READY || ev.data?.ready === true;
+      if (!isReady) return;
       this._quickEditLocalPort = null;
       onReady(port1);
     };
     try {
-      const targetOrigin = new URL(iframe.src).origin;
-      iframe.contentWindow.postMessage({ init: config, location }, targetOrigin, [port2]);
+      // @deprecated top-level init/location — prefer type/payload. Kept so the quick-edit
+      // iframe script (da-nx) keeps working until it migrates.
+      iframe.contentWindow.postMessage({
+        init: config,
+        location,
+        type: MESSAGE_TYPES.INIT,
+        payload: { config, location },
+      }, '*', [port2]);
     } catch (err) {
       this._disposeQuickEditLocalPort();
       // eslint-disable-next-line no-console
@@ -180,7 +193,13 @@ export class EwEditorWysiwyg extends LitElement {
     this._clearQuickEditRetry();
     this._syncCanvasVisibility();
 
-    const { config, location } = buildQuickEditInitPayload({ org, repo, path });
+    const { config, location } = buildQuickEditInitPayload({
+      org,
+      repo,
+      path,
+      branch: this._wysiwygBranch ?? 'main',
+      canWrite: this.canWrite === true,
+    });
     const send = () => this._postQuickEditInitToIframe({
       iframe,
       config,

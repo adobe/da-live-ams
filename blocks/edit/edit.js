@@ -1,8 +1,13 @@
 import getPathDetails from '../shared/pathDetails.js';
-import { daFetch, contentLogin, livePreviewLogin } from '../shared/utils.js';
+import { contentLogin, livePreviewLogin } from '../shared/utils.js';
+import { getNx, getNx2Api } from '../../scripts/utils.js';
 
 import './da-title/da-title.js';
 import './da-content/da-content.js';
+
+const { loadStyle } = await import(`${getNx()}/utils/utils.js`);
+const styles = await loadStyle(import.meta.url);
+document.adoptedStyleSheets.push(styles);
 
 const EMPTY_DOC = '<body><header></header><main><div></div></main><footer></footer></body>';
 const DOMPARSER = new DOMParser();
@@ -11,15 +16,13 @@ let prose;
 let prosePromise;
 
 async function getDoc(path) {
-  return daFetch(path);
+  const { source } = await getNx2Api();
+  return source.get(path);
 }
 
 async function createDoc(path) {
-  const body = new FormData();
-  const data = new Blob([EMPTY_DOC], { type: 'text/html' });
-  body.append('data', data);
-  const opts = { body, method: 'POST' };
-  return daFetch(path, opts);
+  const { source } = await getNx2Api();
+  return source.save(path, { body: EMPTY_DOC });
 }
 
 function initArea(areaName, details, el) {
@@ -38,7 +41,11 @@ async function setUI(el) {
   const details = getPathDetails();
   if (!details) return;
 
-  const docPromise = getDoc(details.sourceUrl);
+  // Warm the hlx6 probe cache up front so createConnection's `await isHlx6(...)`
+  // resolves from cache instead of gating the WebSocket on a network round-trip.
+  getNx2Api().then(({ isHlx6 }) => isHlx6(details.org, details.site)).catch(() => {});
+
+  const docPromise = getDoc(details.fullpath);
   prosePromise ??= import('./prose/index.js');
 
   // Start WebSocket as soon as prose module loads (don't wait for logins/doc)
@@ -80,7 +87,7 @@ async function setUI(el) {
       window.location = `/#${details.parent}`;
       return;
     }
-    const createResp = await createDoc(details.sourceUrl);
+    const createResp = await createDoc(details.fullpath);
     permissions = createResp.permissions;
     doc = DOMPARSER.parseFromString(EMPTY_DOC, 'text/html');
   } else {

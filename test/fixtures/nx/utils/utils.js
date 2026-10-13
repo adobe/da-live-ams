@@ -4,4 +4,22 @@ export const loadStyle = async () => {
   return sheet;
 };
 
-export const DA_ADMIN = 'https://admin.da.live';
+export const loadScript = async () => {};
+
+export const DA_ADMIN = 'https://admin.ent-da.live';
+
+export const DA_COLLAB = 'wss://collab.ent-da.live';
+
+let _hashState = {};
+const _hashSubscribers = new Set();
+export const hashChange = {
+  subscribe(fn) {
+    _hashSubscribers.add(fn);
+    fn(_hashState);
+    return () => _hashSubscribers.delete(fn);
+  },
+  _set(state) {
+    _hashState = state;
+    _hashSubscribers.forEach((fn) => fn(state));
+  },
+};

@@ -1,9 +1,23 @@
-import { getNx, getNx2Api, nxJS } from '../../../scripts/utils.js';
+import { getNx, getNx2Api } from '../../../scripts/utils.js';
 import { handleSave, staleCheck } from './utils.js';
 import '../da-sheet-tabs.js';
 
-const { loadStyle } = await import(`${getNx()}${nxJS}`);
-const loadScript = (await import(`${getNx()}/utils/script.js`)).default;
+const nx = getNx();
+const isNx2 = nx.endsWith('/nx2');
+const { loadStyle } = await import(`${nx}/utils/utils.js`);
+// TODO: remove the ternary and the nx v1 branch once nxver=2 is rolled
+// out on the CDN. Kept for backward compat during the transition:
+// nx v1 exposes loadScript at utils/script.js; nx2 re-exports it from
+// utils/utils.js.
+const loadScript = isNx2
+  ? (await import(`${nx}/utils/utils.js`)).loadScript
+  : (await import(`${nx}/utils/script.js`)).default;
+
+async function adoptStyle(href) {
+  const sheet = await loadStyle(href);
+  if (!sheet || document.adoptedStyleSheets.includes(sheet)) return;
+  document.adoptedStyleSheets = [...document.adoptedStyleSheets, sheet];
+}
 
 const SHEET_TEMPLATE = { minDimensions: [20, 20], sheetName: 'data' };
 
@@ -23,9 +37,14 @@ function finishSetup(el, data) {
   el.jexcel.forEach((sheet, idx) => {
     sheet.name = data[idx].sheetName;
     sheet.options.onbeforepaste = (_el, pasteVal) => pasteVal?.trim();
-    sheet.options.onafterchanges = () => {
-      handleSave(el.jexcel, el.details.view);
-    };
+    const save = () => handleSave(el.jexcel, el.details.view);
+    sheet.options.onafterchanges = save;
+    // onafterchanges doesn't fire for these; inserts are skipped since they start empty
+    // and get saved once onafterchanges fires on their content. onmovecolumn is left
+    // unbound - columnDrag is off, so there's no UI path that can ever fire it.
+    sheet.options.ondeleterow = save;
+    sheet.options.ondeletecolumn = save;
+    sheet.options.onmoverow = save;
   });
 
   // Setup tabs
@@ -83,20 +102,24 @@ export function getPermissions() {
   return permissions;
 }
 
-export async function getData(url) {
+// Takes a pathDetails object ({ org, site, path, view }). For a version restore,
+// pass the same doc details plus a `versionId` and it routes through versions.get.
+export async function getData(input) {
   const { config, source, versions } = await getNx2Api();
-  const { pathname } = new URL(url);
+  const { org, site, path, view, versionId } = input;
 
-  const [api, org, site, ...parts] = pathname.slice(1).split('/');
-  let getFn = source.get;
-  if (api === 'config') getFn = config.get;
+  // Version snapshots are immutable; only live-file reads need to wait for our own writes.
+  if (!versionId) await staleCheck.awaitPendingSave();
 
   let resp;
-  if (api === 'versionsource') {
-    getFn = versions.get;
-    resp = await getFn({ org, site, versionId: parts.join('/') });
+  let isVersion = false;
+  if (versionId) {
+    isVersion = true;
+    resp = await versions.get({ org, site, path, versionId });
+  } else if (view === 'config') {
+    resp = await config.get({ org, site, cachebust: true });
   } else {
-    resp = await getFn({ org, site, path: parts.join('/') });
+    resp = await source.get({ org, site, path, cachebust: true });
   }
 
   // Set permissions even if the file is a 404
@@ -113,8 +136,8 @@ export async function getData(url) {
   // Get base data
   const json = await resp.json();
 
-  if (!url.includes('/versionsource')) {
-    staleCheck.markSynced(json);
+  if (!isVersion) {
+    staleCheck.markSynced(resp.headers.get('etag'));
     const sheetPanes = document.querySelector('da-sheet-panes');
     if (sheetPanes) sheetPanes.data = json;
   }
@@ -143,9 +166,9 @@ export async function getData(url) {
 }
 
 export default async function init(el, data) {
-  const suppliedData = data || await getData(el.details.sourceUrl);
+  const suppliedData = data || await getData(el.details);
 
-  await loadStyle('/deps/jspreadsheet-ce/dist/jspreadsheet.css');
+  await adoptStyle('/deps/jspreadsheet-ce/dist/jspreadsheet.css');
   await loadScript('/deps/jspreadsheet-ce/dist/index.js');
   await loadScript('/deps/jsuites/dist/jsuites.js');
 

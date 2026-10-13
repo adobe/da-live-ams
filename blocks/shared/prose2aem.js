@@ -1,3 +1,5 @@
+import getPathDetails from './pathDetails.js';
+
 function setCursor(cursor, el) {
   el.id = cursor.id;
   cursor.remove();
@@ -192,6 +194,35 @@ function removeMetadata(editor) {
   editor.querySelector('.metadata')?.remove();
 }
 
+function applySectionMetadata(editor) {
+  editor.querySelectorAll('.section-metadata').forEach((block) => {
+    const section = block.parentElement;
+    block.querySelectorAll(':scope > div').forEach((row) => {
+      const cols = row.querySelectorAll(':scope > div');
+      if (cols.length < 2) return;
+      const key = cols[0].textContent.trim().toLowerCase()
+        .replace(/[^0-9a-z]+/g, '-')
+        .replace(/^-+|-+$/g, '');
+      if (!key) return;
+      if (key === 'style') {
+        cols[1].textContent.trim().split(',')
+          .map((s) => s.trim().toLowerCase().replace(/[^0-9a-z]+/g, '-').replace(/^-+|-+$/g, ''))
+          .filter(Boolean)
+          .forEach((cls) => section.classList.add(cls));
+      } else {
+        const camelKey = key.replace(/-([a-z])/g, (_, c) => c.toUpperCase());
+        const linkEl = cols[1].querySelector('a');
+        const imgEl = cols[1].querySelector('img');
+        let value = cols[1].textContent.trim();
+        if (linkEl) value = linkEl.href;
+        else if (imgEl) value = imgEl.src;
+        section.dataset[camelKey] = value;
+      }
+    });
+    block.remove();
+  });
+}
+
 const iconRegex = /(?<!(?:https?|urn)[^\s<>]*):(#?[a-z_-]+[a-z\d]*):/gi; // matches icon pattern but not in URLs
 function parseIcons(editor) {
   if (!iconRegex.test(editor.innerHTML)) return;
@@ -202,6 +233,30 @@ function parseIcons(editor) {
 }
 
 const removeEls = (els) => els.forEach((el) => el.remove());
+
+function convertLocalUrlsToRelative(editor) {
+  const pathDetails = getPathDetails();
+  if (!pathDetails?.org || !pathDetails?.site) return;
+
+  const { org, site } = pathDetails;
+
+  const links = editor.querySelectorAll('a[href]');
+  links.forEach((link) => {
+    const url = link.getAttribute('href');
+    if (!url || !url.startsWith('https://')) return;
+
+    try {
+      const { hostname, pathname, search, hash } = new URL(url);
+
+      const sameSitePattern = `--${site}--${org}.aem.`;
+      if (hostname.includes(sameSitePattern)) {
+        link.setAttribute('href', `${pathname}${search}${hash}`);
+      }
+    } catch {
+      // ignore
+    }
+  });
+}
 
 /**
  * A utility to take ProseMirror formatted DOM and convert to AEM semantic markup
@@ -215,6 +270,10 @@ export default function prose2aem(editor, livePreview, isFragment = false) {
 
   editor.removeAttribute('contenteditable');
   editor.removeAttribute('translate');
+
+  if (livePreview) {
+    convertLocalUrlsToRelative(editor);
+  }
 
   const daDiffDeletedEls = editor.querySelectorAll('da-diff-deleted');
   removeEls(daDiffDeletedEls);
@@ -251,6 +310,7 @@ export default function prose2aem(editor, livePreview, isFragment = false) {
 
   if (!isFragment) {
     makeSections(editor);
+    if (livePreview) applySectionMetadata(editor);
   }
 
   if (isFragment) {

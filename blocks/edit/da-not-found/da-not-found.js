@@ -1,17 +1,17 @@
 import '../../shared/da-dialog/da-dialog.js';
-import { daFetch } from '../../shared/utils.js';
-import { DA_ORIGIN } from '../../shared/constants.js';
-import { getNx, nxJS } from '../../../scripts/utils.js';
+import { getNx, getNx2Api } from '../../../scripts/utils.js';
 
-const { loadStyle } = await import(`${getNx()}${nxJS}`);
-await loadStyle('/blocks/edit/da-not-found/da-not-found.css');
+const { loadStyle } = await import(`${getNx()}/utils/utils.js`);
+const sheet = await loadStyle('/blocks/edit/da-not-found/da-not-found.css');
+if (sheet && !document.adoptedStyleSheets.includes(sheet)) {
+  document.adoptedStyleSheets = [...document.adoptedStyleSheets, sheet];
+}
 
 async function folderHasContents(folderPath) {
   try {
-    const resp = await daFetch(`${DA_ORIGIN}/list${folderPath}`);
-    if (!resp.ok) return false;
-    const json = await resp.json();
-    return Array.isArray(json) && json.length > 0;
+    const { source } = await getNx2Api();
+    const { ok, items } = await source.list(folderPath);
+    return ok && items.length > 0;
   } catch {
     return false;
   }

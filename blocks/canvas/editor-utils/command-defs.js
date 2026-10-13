@@ -25,7 +25,14 @@ import {
   inTable,
   canMergeCells,
   canSplitCell,
+  isImageNodeSelected,
+  selectionHasLink,
+  removeLink,
 } from './command-helpers.js';
+import { openLinkDialog, openAltDialog, triggerAddImage } from './selection-toolbar.js';
+import { blockItemsForQuery, hasLibrary, insertBlockItem, getState } from './block-slash.js';
+
+const notImageSelected = (state) => !isImageNodeSelected(state);
 
 /** Spectrum icon stem for `/img/icons/s2-icon-{stem}-20-n.svg` */
 const iconName = (name) => name.replace(/-/g, '').toLowerCase();
@@ -38,6 +45,7 @@ export const COMMANDS = [
     schema: 'strong',
     icon: iconName('TagBold'),
     showIn: ['toolbar-marks'],
+    visible: notImageSelected,
     active: (state) => markIsActive(state, 'strong'),
     apply: inlineMark('strong'),
   },
@@ -47,6 +55,7 @@ export const COMMANDS = [
     schema: 'em',
     icon: iconName('TagItalic'),
     showIn: ['toolbar-marks'],
+    visible: notImageSelected,
     active: (state) => markIsActive(state, 'em'),
     apply: inlineMark('em'),
   },
@@ -56,6 +65,7 @@ export const COMMANDS = [
     schema: 'code',
     icon: iconName('Code'),
     showIn: ['toolbar-marks'],
+    visible: notImageSelected,
     active: (state) => markIsActive(state, 'code'),
     apply: inlineMark('code'),
   },
@@ -65,6 +75,7 @@ export const COMMANDS = [
     schema: 'u',
     icon: iconName('TagUnderline'),
     showIn: ['toolbar-marks'],
+    visible: notImageSelected,
     active: (state) => markIsActive(state, 'u'),
     apply: inlineMark('u'),
   },
@@ -74,8 +85,29 @@ export const COMMANDS = [
     schema: 's',
     icon: iconName('TagStrikeThrough'),
     showIn: ['toolbar-marks'],
+    visible: notImageSelected,
     active: (state) => markIsActive(state, 's'),
     apply: inlineMark('s'),
+  },
+  {
+    id: 'sup',
+    label: 'Superscript',
+    schema: 'sup',
+    icon: iconName('TextSuperscript'),
+    showIn: ['toolbar-marks'],
+    visible: notImageSelected,
+    active: (state) => markIsActive(state, 'sup'),
+    apply: inlineMark('sup'),
+  },
+  {
+    id: 'sub',
+    label: 'Subscript',
+    schema: 'sub',
+    icon: iconName('TextSubscript'),
+    showIn: ['toolbar-marks'],
+    visible: notImageSelected,
+    active: (state) => markIsActive(state, 'sub'),
+    apply: inlineMark('sub'),
   },
 
   // Toolbar: block-type picker
@@ -84,6 +116,7 @@ export const COMMANDS = [
     label: 'Paragraph',
     schema: 'paragraph',
     showIn: ['toolbar-picker'],
+    visible: notImageSelected,
     apply: blockType('paragraph'),
   },
   {
@@ -92,6 +125,7 @@ export const COMMANDS = [
     icon: iconName('Heading1'),
     schema: 'heading',
     showIn: ['toolbar-picker', 'slash-text'],
+    visible: notImageSelected,
     apply: blockType('heading', { level: 1 }),
   },
   {
@@ -100,6 +134,7 @@ export const COMMANDS = [
     icon: iconName('Heading2'),
     schema: 'heading',
     showIn: ['toolbar-picker', 'slash-text'],
+    visible: notImageSelected,
     apply: blockType('heading', { level: 2 }),
   },
   {
@@ -108,6 +143,7 @@ export const COMMANDS = [
     icon: iconName('Heading3'),
     schema: 'heading',
     showIn: ['toolbar-picker', 'slash-text'],
+    visible: notImageSelected,
     apply: blockType('heading', { level: 3 }),
   },
   {
@@ -116,6 +152,7 @@ export const COMMANDS = [
     icon: iconName('Heading4'),
     schema: 'heading',
     showIn: ['toolbar-picker', 'slash-text'],
+    visible: notImageSelected,
     apply: blockType('heading', { level: 4 }),
   },
   {
@@ -124,6 +161,7 @@ export const COMMANDS = [
     icon: iconName('Heading5'),
     schema: 'heading',
     showIn: ['toolbar-picker', 'slash-text'],
+    visible: notImageSelected,
     apply: blockType('heading', { level: 5 }),
   },
   {
@@ -132,6 +170,7 @@ export const COMMANDS = [
     icon: iconName('Heading6'),
     schema: 'heading',
     showIn: ['toolbar-picker', 'slash-text'],
+    visible: notImageSelected,
     apply: blockType('heading', { level: 6 }),
   },
   {
@@ -140,6 +179,7 @@ export const COMMANDS = [
     icon: iconName('BlockCode'),
     schema: 'code_block',
     showIn: ['toolbar-picker', 'slash-text'],
+    visible: notImageSelected,
     disabled: (state) => state.selection.$from.parent.type.name === 'code_block',
     apply: blockType('code_block'),
   },
@@ -151,6 +191,7 @@ export const COMMANDS = [
     icon: iconName('BlockQuote'),
     schema: 'blockquote',
     showIn: ['toolbar-structure', 'slash-text'],
+    visible: notImageSelected,
     apply: wrap('blockquote'),
   },
   {
@@ -159,7 +200,7 @@ export const COMMANDS = [
     icon: iconName('ListBulleted'),
     schema: 'bullet_list',
     showIn: ['toolbar-structure', 'slash-text'],
-    visible: ({ selection: { $from } }) => !inList($from),
+    visible: (state) => notImageSelected(state) && !inList(state.selection.$from),
     apply: list('bullet_list'),
   },
   {
@@ -168,7 +209,7 @@ export const COMMANDS = [
     icon: iconName('ListNumbered'),
     schema: 'ordered_list',
     showIn: ['toolbar-structure', 'slash-text'],
-    visible: ({ selection: { $from } }) => !inList($from),
+    visible: (state) => notImageSelected(state) && !inList(state.selection.$from),
     apply: list('ordered_list'),
   },
   {
@@ -176,7 +217,7 @@ export const COMMANDS = [
     label: 'Indent list',
     icon: iconName('TextIndentIncrease'),
     showIn: ['toolbar-structure'],
-    visible: ({ selection: { $from } }) => inList($from),
+    visible: (state) => notImageSelected(state) && inList(state.selection.$from),
     disabled: (state) => !canSinkList(state),
     apply: sinkListLevel,
   },
@@ -185,7 +226,7 @@ export const COMMANDS = [
     label: 'Outdent list',
     icon: iconName('TextIndentDecrease'),
     showIn: ['toolbar-structure'],
-    visible: ({ selection: { $from } }) => inList($from),
+    visible: (state) => notImageSelected(state) && inList(state.selection.$from),
     disabled: (state) => !canLiftList(state),
     apply: liftListLevel,
   },
@@ -243,7 +284,7 @@ export const COMMANDS = [
     id: 'table-merge-cells',
     label: 'Merge cells',
     icon: iconName('tablemergecells'),
-    showIn: ['toolbar-table'],
+    showIn: ['toolbar-table', 'slash-cell'],
     visible: canMergeCells,
     apply: mergeTableCells,
   },
@@ -251,9 +292,52 @@ export const COMMANDS = [
     id: 'table-split-cell',
     label: 'Split cell',
     icon: iconName('tablesplitcell'),
-    showIn: ['toolbar-table'],
+    showIn: ['toolbar-table', 'slash-cell'],
     visible: canSplitCell,
     apply: splitTableCell,
+  },
+
+  // Toolbar: link buttons
+  {
+    id: 'link-create',
+    label: 'Create link',
+    icon: 'link',
+    showIn: ['toolbar-link'],
+    visible: (state) => !selectionHasLink(state),
+    apply: openLinkDialog,
+  },
+  {
+    id: 'link-edit',
+    label: 'Edit link',
+    icon: 'link',
+    showIn: ['toolbar-link'],
+    visible: selectionHasLink,
+    apply: openLinkDialog,
+  },
+  {
+    id: 'link-remove',
+    label: 'Remove link',
+    icon: 'unlink',
+    showIn: ['toolbar-link'],
+    visible: selectionHasLink,
+    apply: removeLink,
+  },
+
+  // Toolbar: image commands
+  {
+    id: 'image-alt-text',
+    label: 'Edit alt text',
+    icon: iconName('imagetext'),
+    showIn: ['toolbar-image'],
+    visible: isImageNodeSelected,
+    apply: openAltDialog,
+  },
+  {
+    id: 'image-add',
+    label: 'Add image',
+    icon: iconName('imageadd'),
+    showIn: ['toolbar-image'],
+    apply: triggerAddImage,
   },
 
   // Slash menu: text section only
@@ -290,16 +374,13 @@ export const COMMANDS = [
   // Slash menu: blocks section
   {
     id: 'open-library',
-    label: 'Open library',
+    label: 'Open block library',
     icon: iconName('CCLibrary'),
     showIn: ['slash-blocks'],
-    apply: () => {
-      const evt = new CustomEvent('nx-canvas-open-panel', {
-        bubbles: true,
-        composed: true,
-        detail: { position: 'after', viewId: 'blocks' },
-      });
-      document.querySelector('ew-canvas-header')?.dispatchEvent(evt);
+    apply: async (view) => {
+      const { insertBlock } = await import('../ew-panel-extensions/helpers.js');
+      const { openBlockLibraryModal } = await import('../ew-block-library-modal/ew-block-library-modal.js');
+      openBlockLibraryModal({ onInsert: (dom) => insertBlock(view, dom) });
     },
   },
   {
@@ -328,18 +409,57 @@ export function commandsFor(showIn) {
 
 export const COMMAND_BY_ID = new Map(COMMANDS.map((c) => [c.id, c]));
 
-const SLASH_GROUPS = [
-  { section: 'Blocks', showIn: 'slash-blocks' },
-  { section: 'Text', showIn: 'slash-text' },
-];
+function toSlashItem(cmd, extra) {
+  const item = { id: cmd.id, label: cmd.label, icon: cmd.icon };
+  return extra ? { ...item, ...extra } : item;
+}
 
 export function slashMenuItemsForQuery(query) {
-  const q = (query || '').toLowerCase();
-  const groups = SLASH_GROUPS
-    .map(({ section, showIn }) => ({
-      section,
-      items: commandsFor(showIn).filter((i) => !q || i.label.toLowerCase().startsWith(q)),
-    }))
-    .filter((g) => g.items.length > 0);
-  return groups.flatMap(({ section, items }) => [{ section }, ...items]);
+  const raw = query || '';
+  const q = raw.toLowerCase();
+
+  // the library is fetched on demand when the slash menu opens. static commands
+  // (Text, Insert block) render immediately - block results stream in once the
+  // async load settles.
+  const loading = getState() === 'loading';
+
+  const blockRows = raw.trim() ? blockItemsForQuery(raw) : [];
+  const blockCmds = commandsFor('slash-blocks')
+    .filter((c) => (c.id !== 'open-library' || hasLibrary()))
+    .filter((c) => !q || c.label.toLowerCase().startsWith(q))
+    .map((c) => (c.id === 'open-library' && !raw.trim()
+      // On the bare "/" menu, hint that typing searches the configured library.
+      ? toSlashItem(c, { description: 'Or type a block name to search' })
+      : toSlashItem(c)));
+  const blockItems = [...blockRows, ...blockCmds];
+
+  const showLoading = loading && !!raw.trim() && !blockRows.length;
+
+  const textItems = commandsFor('slash-text')
+    .filter((c) => !q || c.label.toLowerCase().startsWith(q))
+    .map((c) => toSlashItem(c));
+
+  const out = [];
+  if (blockItems.length) {
+    out.push({ section: 'Blocks' }, ...blockItems);
+  } else if (showLoading) {
+    out.push({ section: 'Loading blocks…' });
+  }
+  if (textItems.length) out.push({ section: 'Text' }, ...textItems);
+  return out;
+}
+
+export function applySlashSelection(view, id) {
+  const command = COMMAND_BY_ID.get(id);
+  if (command) return command.apply(view);
+  if (id?.startsWith('block:')) return insertBlockItem(view, id);
+  return undefined;
+}
+
+// Cell commands offered when "/" is pressed on a multi-cell selection, filtered
+// to those currently available (mirrors the classic editor's cell slash menu).
+export function cellSelectionSlashItems(state) {
+  return commandsFor('slash-cell')
+    .filter((cmd) => cmd.visible?.(state))
+    .map((cmd) => toSlashItem(cmd));
 }
