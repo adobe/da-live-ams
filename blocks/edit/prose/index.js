@@ -24,10 +24,11 @@ import {
 
 import { getSchema } from 'da-parser';
 import { COLLAB_ORIGIN, DA_ORIGIN } from '../../shared/constants.js';
-import { daFetch, getAuthToken } from '../../shared/utils.js';
+import { getAuthToken } from '../../shared/utils.js';
+import { getNx2Api } from '../../../scripts/utils.js';
 import { getDiffClass, checkForLocNodes, addActiveView } from './diff/diff-utils.js';
 import { debounce, initDaMetadata } from '../utils/helpers.js';
-import { forceSave } from './forcesave.js';
+import { forceSave } from '../../shared/forcesave.js';
 
 // Rapid-reconnect guard (COR-44): y-websocket resets its backoff counter on
 // every successful onopen, so a close that follows a brief successful
@@ -40,14 +41,25 @@ const SHORT_SESSION_BASE_MS = 1000;
 const SHORT_SESSION_MAX_MS = 30000;
 
 async function checkDoc(path) {
-  return daFetch(path, { method: 'HEAD' });
+  const { source } = await getNx2Api();
+  const { pathname } = new URL(path);
+  const [, org, site, ...parts] = pathname.slice(1).split('/');
+  return source.getMetadata({ org, site, path: `/${parts.join('/')}` });
 }
 
 export async function createConnection(path) {
   const ydoc = new Y.Doc();
 
   const server = COLLAB_ORIGIN;
-  const roomName = `${DA_ORIGIN}${new URL(path).pathname}`;
+
+  const { pathname } = new URL(path);
+  const [, , org, site, ...parts] = pathname.split('/');
+  const { AEM_API, isHlx6 } = await getNx2Api();
+  const hlx6 = await isHlx6(org, site);
+
+  const roomName = hlx6
+    ? `${AEM_API}/${org}/sites/${site}/source/${parts.join('/')}`
+    : `${DA_ORIGIN}${pathname}`;
 
   const opts = {
     protocols: ['yjs'],
@@ -137,6 +149,7 @@ async function loadCustomPlugins() {
     { default: tableSelectHandle },
     { default: linkConverter },
     { default: linkTextSync },
+    { default: mediaBusImage },
     { default: sectionPasteHandler },
     { default: base64Uploader },
     { default: toggleLibrary },
@@ -152,6 +165,7 @@ async function loadCustomPlugins() {
     import('./plugins/tableSelectHandle.js'),
     import('./plugins/linkConverter.js'),
     import('./plugins/linkTextSync.js'),
+    import('./plugins/mediaBusImage.js'),
     import('./plugins/sectionPasteHandler.js'),
     import('./plugins/base64uploader.js'),
     import('../da-library/da-library.js'),
@@ -170,6 +184,7 @@ async function loadCustomPlugins() {
     tableSelectHandle,
     linkConverter,
     linkTextSync,
+    mediaBusImage,
     sectionPasteHandler,
     base64Uploader,
     toggleLibrary,
@@ -451,6 +466,7 @@ function applyDelayedPlugins(pluginsPromise, schema, canWrite, basePlugins) {
       plugins.imageDrop(schema),
       plugins.linkConverter(schema),
       plugins.linkTextSync(),
+      plugins.mediaBusImage(),
       plugins.sectionPasteHandler(schema),
       plugins.base64Uploader(schema),
       columnResizing(),
@@ -493,6 +509,9 @@ function applyDelayedPlugins(pluginsPromise, schema, canWrite, basePlugins) {
     // Reconfigure the view with the full plugin list
     const newState = window.view.state.reconfigure({ plugins: pluginList });
     window.view.updateState(newState);
+    // reconfigure() destroys/recreates all plugin views, incl. the cursor plugin, which
+    // nulls collab cursor awareness on destroy. Force an update pass to re-broadcast it.
+    window.view.dispatch(window.view.state.tr);
   });
 }
 

@@ -1,11 +1,24 @@
 import { expect } from '@esm-bundle/chai';
 import { formatDate } from '../../../../../blocks/shared/utils.js';
-import { formatVersions } from '../../../../../blocks/shared/version/helpers.js';
+import { formatVersions, buildDisplayItems, formatUser } from '../../../../../blocks/shared/version/helpers.js';
 
 const TIME_OPTS = { hour: 'numeric', minute: '2-digit' };
 const DATE_OPTS = { year: 'numeric', month: 'short', day: 'numeric' };
 
+const ver = (overrides = {}) => ({ isVersion: true, date: 'Jan 1', time: '10:00', users: [], ...overrides });
+
+const auditGroup = (audits = [{ date: 'Jan 1', time: '09:00', users: [] }]) => ({ date: 'Jan 1', audits });
+
 describe('Versions helper', () => {
+  it('Format user returns the plain email for a human', () => {
+    expect(formatUser({ email: 'jane@example.com' })).to.equal('jane@example.com');
+  });
+
+  it('Format user appends (agent) when isAgentic is set', () => {
+    expect(formatUser({ email: 'jane@example.com', isAgentic: true }))
+      .to.equal('jane@example.com (agent)');
+  });
+
   it('Format date', () => {
     const { date: d, time: t } = formatDate(1709205071123);
 
@@ -167,5 +180,106 @@ describe('Versions helper', () => {
     expect(formatted[2].isVersion).to.be.undefined;
     expect(formatted[2].audits).to.have.length(1);
     expect(formatted[2].audits[0].users[0].email).to.equal('before@acme.com');
+  });
+
+  it('Normalizes hlx6 (.versions) records to the canonical version shape', () => {
+    const versions = [{
+      version: '01KVB6GVE75R432GPNZ8AVADFG',
+      'doc-last-modified': '2026-06-12T18:58:32.000Z',
+      'doc-path-hint': '/hello.html',
+      'doc-last-modified-by': 'CPEYER@ADOBE.COM',
+      'version-date': '2026-06-17T16:27:09.000Z',
+      'version-by': 'CPEYER@ADOBE.COM',
+      'version-comment': 'test',
+    }, {
+      version: '01KVB6GVE75R432GPNZ8AVADAA',
+      'version-date': '2026-06-15T10:00:00.000Z',
+      'version-by': 'someone@acme.com',
+    }];
+
+    const formatted = formatVersions(versions);
+
+    // Every hlx6 record is a restorable version (no audit grouping).
+    expect(formatted).to.have.length(2);
+
+    // Sorted newest-first by version-date.
+    const [first, second] = formatted;
+    expect(first.isVersion).to.be.true;
+    expect(first.versionId).to.equal('01KVB6GVE75R432GPNZ8AVADFG');
+    expect(first.label).to.equal('test');
+    expect(first.users).to.deep.equal([{ email: 'CPEYER@ADOBE.COM' }]);
+    expect(first.timestamp).to.equal(Date.parse('2026-06-17T16:27:09.000Z'));
+    expect(first.url).to.be.undefined;
+
+    // A record with no comment is still a version, just unlabelled.
+    expect(second.isVersion).to.be.true;
+    expect(second.versionId).to.equal('01KVB6GVE75R432GPNZ8AVADAA');
+    expect(second.label).to.be.undefined;
+  });
+
+  it('Collapses duplicate hlx6 records sharing the same versionId', () => {
+    const versions = [{
+      version: '01KVB6GVE75R432GPNZ8AVADFG',
+      'version-date': '2026-06-17T16:27:09.000Z',
+      'version-by': 'someone@acme.com',
+      'version-comment': 'Test',
+    }, {
+      version: '01KVB6GVE75R432GPNZ8AVADFG',
+      'version-date': '2026-06-17T16:27:09.000Z',
+      'version-by': 'someone@acme.com',
+      'version-comment': 'Test',
+    }];
+
+    const formatted = formatVersions(versions);
+
+    expect(formatted).to.have.length(1);
+    expect(formatted[0].versionId).to.equal('01KVB6GVE75R432GPNZ8AVADFG');
+  });
+
+  it('Collapses duplicate hlx5 version records sharing the same url', () => {
+    const versions = [{
+      url: '/versionsource/joey/abc.html',
+      users: [{ email: 'anonymous' }],
+      timestamp: 1715594886177,
+      label: 'Test',
+    }, {
+      url: '/versionsource/joey/abc.html',
+      users: [{ email: 'anonymous' }],
+      timestamp: 1715594886177,
+      label: 'Test',
+    }];
+
+    const formatted = formatVersions(versions);
+
+    expect(formatted).to.have.length(1);
+    expect(formatted[0].url).to.equal('/versionsource/joey/abc.html');
+  });
+});
+
+describe('buildDisplayItems', () => {
+  it('merges adjacent audit groups into one expand/collapse entry', () => {
+    const result = buildDisplayItems([auditGroup(), auditGroup()]);
+    expect(result).to.have.lengthOf(1);
+    expect(result[0].audits).to.have.lengthOf(2);
+  });
+
+  it('a version between two audit groups prevents them from merging', () => {
+    const result = buildDisplayItems([auditGroup(), ver(), auditGroup()]);
+    expect(result).to.have.lengthOf(3);
+    expect(result[0].audits).to.have.lengthOf(1);
+    expect(result[2].audits).to.have.lengthOf(1);
+  });
+
+  it('collects trailing audit groups that follow the last version', () => {
+    const result = buildDisplayItems([ver(), auditGroup(), auditGroup()]);
+    expect(result).to.have.lengthOf(2);
+    expect(result[1].audits).to.have.lengthOf(2);
+  });
+
+  it('passes through a list of only versions unchanged', () => {
+    const v1 = ver();
+    const v2 = ver();
+    const result = buildDisplayItems([v1, v2]);
+    expect(result).to.deep.equal([v1, v2]);
   });
 });

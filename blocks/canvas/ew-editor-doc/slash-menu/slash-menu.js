@@ -1,9 +1,21 @@
 /* eslint-disable import/no-unresolved -- importmap */
 import { Plugin } from 'da-y-wrapper';
 import { getNx } from '../../../../scripts/utils.js';
-import { slashMenuItemsForQuery, COMMAND_BY_ID } from '../../editor-utils/command-defs.js';
+import {
+  slashMenuItemsForQuery,
+  applySlashSelection,
+  cellSelectionSlashItems,
+} from '../../editor-utils/command-defs.js';
+import { ensureBlockLibrary } from '../../editor-utils/block-slash.js';
+import {
+  ensureBlockOptions,
+  blockOptionItems,
+  isBlockOption,
+  applyBlockOption,
+} from './block-options.js';
 
 await import(`${getNx()}/blocks/shared/menu/menu.js`);
+const { hashChange } = await import(`${getNx()}/utils/utils.js`);
 
 function inTopLevelParagraph($from) {
   if ($from.parent.type.name !== 'paragraph') return false;
@@ -11,21 +23,43 @@ function inTopLevelParagraph($from) {
   return $from.node($from.depth - 1).type.name === 'doc';
 }
 
-function getSlashContext(state) {
+/** 'block' for a top-level paragraph (block insert), 'cell' inside a block cell (options). */
+function paragraphMode($from) {
+  if ($from.parent.type.name !== 'paragraph' || $from.depth < 1) return null;
+  const parentType = $from.node($from.depth - 1).type.name;
+  if (parentType === 'doc') return 'block';
+  if (parentType === 'table_cell') return 'cell';
+  return null;
+}
+
+export function getSlashContext(state) {
   const { $from } = state.selection;
-  if (!inTopLevelParagraph($from)) return null;
+  const mode = paragraphMode($from);
+  if (!mode) return null;
 
   const paraStart = $from.start();
   const head = state.selection.from;
   if (head <= paraStart) return null;
 
   const prefix = state.doc.textBetween(paraStart, head, '\ufffc', '\ufffc');
-  if (!prefix.startsWith('/')) return null;
+  const slashIndex = prefix.lastIndexOf('/');
+  if (slashIndex === -1) return null;
 
-  const query = prefix.slice(1);
-  if (/\s/.test(query)) return null;
+  if (slashIndex > 0) {
+    if (mode !== 'cell') return null;
+    if (!prefix.slice(0, slashIndex).trimEnd().endsWith(',')) return null;
+  }
 
-  return { query, anchorPos: paraStart };
+  const query = prefix.slice(slashIndex + 1);
+  if (query.length > 50) return null;
+
+  return { query, anchorPos: paraStart + slashIndex, mode };
+}
+
+// A CellSelection (one or more selected table cells) carries `$anchorCell`;
+// text and node selections do not. Used to offer the merge/split slash menu.
+export function hasCellSelection(state) {
+  return !!state.selection.$anchorCell;
 }
 
 function shouldShowSlashHint(state) {
@@ -38,7 +72,7 @@ function shouldShowSlashHint(state) {
   );
 }
 
-function setup(container, view) {
+function setup(container, view, ctxRef) {
   const anchor = document.createElement('span');
   anchor.style.cssText = 'position:absolute;width:0;height:0;pointer-events:none';
   container.append(anchor);
@@ -50,15 +84,25 @@ function setup(container, view) {
   container.append(menu);
 
   menu.addEventListener('select', (e) => {
-    const run = COMMAND_BY_ID.get(e.detail.id)?.apply;
     const { state } = view;
+    // Cell-selection mode has no "/query" text to strip - just run the command.
+    if (ctxRef.cellMode) {
+      ctxRef.cellMode = false;
+      menu.close();
+      applySlashSelection(view, e.detail.id);
+      view.focus();
+      return;
+    }
     const slash = getSlashContext(state);
-    if (slash && run) {
+    if (slash) {
       const { anchorPos } = slash;
       const head = state.selection.from;
-      const tr = state.tr.delete(anchorPos, head);
-      view.dispatch(tr);
-      run(view);
+      view.dispatch(state.tr.delete(anchorPos, head));
+      if (isBlockOption(e.detail.id)) {
+        applyBlockOption(view, e.detail.id);
+      } else {
+        applySlashSelection(view, e.detail.id);
+      }
     }
     view.focus();
   });
@@ -105,6 +149,16 @@ function syncSlashHint(view, ctxRef) {
 }
 
 function syncSlashUi(view, ctxRef) {
+  // The cell menu is driven from handleKeyDown; skip the text-prefix flow while
+  // it's active, dismissing it only once the cell selection is gone.
+  if (ctxRef.cellMode) {
+    if (!hasCellSelection(view.state)) {
+      ctxRef.cellMode = false;
+      ctxRef.ctx?.menu.close();
+    }
+    return;
+  }
+
   syncSlashHint(view, ctxRef);
 
   const container = view.dom.parentElement;
@@ -117,13 +171,25 @@ function syncSlashUi(view, ctxRef) {
     return;
   }
 
-  const items = slashMenuItemsForQuery(slash.query);
-  if (!items.length) {
+  // In a block cell, offer that block's key/value options; at the top level, the
+  // block-insert / text commands. Both load their data on demand.
+  let items;
+  if (slash.mode === 'cell') {
+    const pending = ensureBlockOptions(ctxRef.orgSite);
+    if (pending) pending.then(() => syncSlashUi(view, ctxRef));
+    items = blockOptionItems(view.state, slash.query);
+  } else {
+    const pending = ensureBlockLibrary(ctxRef.orgSite);
+    if (pending) pending.then(() => syncSlashUi(view, ctxRef));
+    items = slashMenuItemsForQuery(slash.query);
+  }
+
+  if (!items || !items.length) {
     ctxRef.ctx?.menu.close();
     return;
   }
 
-  if (!ctxRef.ctx) ctxRef.ctx = setup(container, view);
+  if (!ctxRef.ctx) ctxRef.ctx = setup(container, view, ctxRef);
   const { menu, anchor } = ctxRef.ctx;
   positionAnchor(view, anchor, slash.anchorPos);
   menu.items = items;
@@ -132,7 +198,19 @@ function syncSlashUi(view, ctxRef) {
   }
 }
 
+function openCellSlashMenu(view, ctxRef, items) {
+  const container = view.dom.parentElement;
+  if (!container) return;
+  if (!ctxRef.ctx) ctxRef.ctx = setup(container, view, ctxRef);
+  ctxRef.cellMode = true;
+  const { menu, anchor } = ctxRef.ctx;
+  positionAnchor(view, anchor, view.state.selection.from);
+  menu.items = items;
+  if (!menu.open) menu.show({ anchor, placement: 'auto' });
+}
+
 function destroySlashUi(ctxRef) {
+  ctxRef.cellMode = false;
   ctxRef.hintEl?.remove();
   ctxRef.hintEl = null;
   const { ctx } = ctxRef;
@@ -149,6 +227,10 @@ export function createSlashMenuPlugin() {
 
   return new Plugin({
     view(editorView) {
+      const unsubHash = hashChange.subscribe((s) => {
+        ctxRef.orgSite = s ? { org: s.org, site: s.site } : undefined;
+      });
+
       const onKeyDown = () => {
         syncSlashUi(editorView, ctxRef);
       };
@@ -161,6 +243,7 @@ export function createSlashMenuPlugin() {
         },
         destroy() {
           editorView.dom.removeEventListener('keydown', onKeyDown);
+          unsubHash?.();
           destroySlashUi(ctxRef);
         },
       };
@@ -168,11 +251,24 @@ export function createSlashMenuPlugin() {
     props: {
       handleKeyDown(view, event) {
         const { ctx } = ctxRef;
-        if (!ctx?.menu.open) return false;
-        const keys = ['ArrowDown', 'ArrowUp', 'Enter', 'Escape'];
-        if (!keys.includes(event.key)) return false;
-        ctx.menu.handleKey(event.key);
-        return true;
+        if (ctx?.menu.open) {
+          const keys = ['ArrowDown', 'ArrowUp', 'Enter', 'Escape'];
+          if (!keys.includes(event.key)) return false;
+          ctx.menu.handleKey(event.key);
+          // Escape (and Enter, via select) closes the menu; leave cell mode too.
+          if (!ctx.menu.open) ctxRef.cellMode = false;
+          return true;
+        }
+        // Classic-editor parity: pressing "/" on a multi-cell selection opens the
+        // merge/split menu (without typing a "/") so cells can be merged by keyboard.
+        if (event.key === '/' && hasCellSelection(view.state)) {
+          const items = cellSelectionSlashItems(view.state);
+          if (!items.length) return false;
+          event.preventDefault();
+          openCellSlashMenu(view, ctxRef, items);
+          return true;
+        }
+        return false;
       },
     },
   });

@@ -30,18 +30,21 @@ import {
 } from '../../edit/prose/plugins/keyHandlers.js';
 import { getHeadingKeymap } from '../../edit/prose/plugins/menu/menu.js';
 import { createSlashMenuPlugin } from './slash-menu/slash-menu.js';
-import { createSelectionToolbarPlugin } from '../editor-utils/selection-toolbar.js';
+import { createSelectionToolbarPlugin, openLinkDialog } from '../editor-utils/selection-toolbar.js';
 import codemark from '../../edit/prose/plugins/codemark.js';
 import tableSelectHandle from '../../edit/prose/plugins/tableSelectHandle.js';
 import imageDrop from './prose-plugins/imageDrop.js';
 import imageFocalPoint from '../../edit/prose/plugins/imageFocalPoint.js';
 import sectionPasteHandler from '../../edit/prose/plugins/sectionPasteHandler.js';
 import base64Uploader from './prose-plugins/base64Uploader.js';
+import blockFocus, { guardFocusedBlockDeletion } from './prose-plugins/blockFocus.js';
 import { getNx } from '../../../scripts/utils.js';
 import { getAuthToken } from '../../shared/utils.js';
 import { generateColor, getCollabIdentity } from './utils/collab.js';
+import { checkBlockLibraryConfigured } from '../editor-utils/block-slash.js';
+import { canvasBus } from '../utils/canvas-bus.js';
 
-const { DA_ADMIN, DA_COLLAB } = await import(`${getNx()}/utils/utils.js`);
+const { DA_COLLAB, hashChange } = await import(`${getNx()}/utils/utils.js`);
 
 function registerErrorHandler(ydoc) {
   ydoc.on('update', () => {
@@ -66,6 +69,19 @@ function addSyncedListener(wsProvider, canWrite, setEditable) {
   wsProvider.on('synced', handleSynced);
 }
 
+function checkLibraryConfiguredOnSync(wsProvider, canWrite) {
+  if (!canWrite) return;
+  const handleSynced = (isSynced) => {
+    if (!isSynced) return;
+    wsProvider.off('synced', handleSynced);
+    const unsub = hashChange.subscribe((s) => {
+      if (s?.org && s?.site) checkBlockLibraryConfigured({ org: s.org, site: s.site });
+    });
+    unsub?.();
+  };
+  wsProvider.on('synced', handleSynced);
+}
+
 export default async function initProse({
   path, permissions, setEditable, getToken,
   extraPlugins = [],
@@ -79,14 +95,15 @@ export default async function initProse({
   const ydoc = new Y.Doc();
 
   const server = DA_COLLAB;
-  const roomName = `${DA_ADMIN}${new URL(path).pathname}`;
+  // da-collab reads the store off the room name, and `path` is already the store's source url.
+  const roomName = path;
 
   const wsOpts = { protocols: ['yjs'] };
   let lastSentToken = null;
   if (typeof getToken === 'function') {
     const t = getToken();
     if (t) {
-      wsOpts.params = { Authorization: `Bearer ${t}` };
+      wsOpts.protocols.push(t);
       lastSentToken = t;
     }
   }
@@ -115,20 +132,17 @@ export default async function initProse({
         }
         return;
       }
-      wsProvider.params = { Authorization: `Bearer ${fresh}` };
+      wsProvider.protocols = ['yjs', fresh];
       lastSentToken = fresh;
       return;
     }
     const fresh = await getAuthToken();
-    if (fresh) {
-      wsProvider.params = { Authorization: `Bearer ${fresh}` };
-    } else {
-      wsProvider.params = {};
-    }
+    wsProvider.protocols = fresh ? ['yjs', fresh] : ['yjs'];
     lastSentToken = fresh;
   });
 
   addSyncedListener(wsProvider, canWrite, setEditable);
+  checkLibraryConfiguredOnSync(wsProvider, canWrite);
   registerErrorHandler(ydoc);
 
   const yXmlFragment = ydoc.getXmlFragment('prosemirror');
@@ -166,6 +180,8 @@ export default async function initProse({
     getEnterInputRulesPlugin(dispatch),
     getURLInputRulesPlugin(),
     getListInputRulesPlugin(schema),
+    // Runs before the base/table keymaps so it can veto deleting the block being edited.
+    keymap({ Backspace: guardFocusedBlockDeletion, Delete: guardFocusedBlockDeletion }),
     keymap(buildKeymap(schema)),
     keymap({ Backspace: handleTableBackspace }),
     keymap(baseKeymap),
@@ -174,6 +190,15 @@ export default async function initProse({
       'Mod-z': (state) => yUndo(state) || false,
       'Mod-y': (state) => yRedo(state) || false,
       'Mod-Shift-z': (state) => yRedo(state) || false,
+      'Mod-k': (_state, _dispatch, view) => {
+        if (!view.editable) return false;
+        openLinkDialog(view);
+        return true;
+      },
+      'Mod-Alt-s': () => {
+        canvasBus.newVersionRequest.emit();
+        return true;
+      },
       ...getHeadingKeymap(schema),
     }),
     keymap({
@@ -186,6 +211,7 @@ export default async function initProse({
     }),
     gapCursor(),
     tableEditing({ allowTableNodeSelection: true }),
+    blockFocus(),
     ...extraPlugins,
   ];
 

@@ -1,7 +1,8 @@
 /* eslint-disable import/no-unresolved -- importmap */
 import { DOMParser as PMDOMParser, DOMSerializer, Slice, TextSelection } from 'da-y-wrapper';
-import { getNx } from '../../../scripts/utils.js';
-import { aemAdmin, daFetch } from '../../shared/utils.js';
+import { getNx, getNx2Api } from '../../../scripts/utils.js';
+import { daFetch } from '../../shared/utils.js';
+import { htmlToProse } from '../../edit/utils/helpers.js';
 import { getExtensionsBridge } from '../editor-utils/extensions-bridge.js';
 
 const { hashChange } = await import(`${getNx()}/utils/utils.js`);
@@ -133,26 +134,47 @@ function getLibraryMetadata(el) {
   }, {});
 }
 
+// Metadata can sit immediately before or after the block it describes, or be
+// nested inside it (nested case also covers any position within a
+// library-container-start/end group, since group children are flattened into
+// the group's own subtree during parsing).
+function findMetaEl(block) {
+  if (block.nextElementSibling?.classList.contains('library-metadata')) {
+    return block.nextElementSibling;
+  }
+  if (block.previousElementSibling?.classList.contains('library-metadata')) {
+    return block.previousElementSibling;
+  }
+  return block.querySelector('.library-metadata');
+}
+
 function transformBlock(block) {
-  const prevSib = block.previousElementSibling;
+  // Skip a preceding metadata sibling so a `heading, metadata, block` layout
+  // still resolves the name from the heading.
+  const headingSib = block.previousElementSibling?.classList.contains('library-metadata')
+    ? block.previousElementSibling.previousElementSibling
+    : block.previousElementSibling;
   let item;
   if (block.dataset.groupheading) {
     item = { name: block.dataset.groupheading };
-  } else if (isHeading(prevSib) && prevSib.textContent) {
-    item = { name: prevSib.textContent };
+  } else if (isHeading(headingSib) && headingSib.textContent) {
+    item = { name: headingSib.textContent };
   } else {
     item = getBlockName(block.className || '');
   }
-  item.dom = block.dataset?.isgroup ? processGroupBlock(block) : getBlockTableHtml(block);
 
-  const metaEl = block.nextElementSibling?.classList.contains('library-metadata')
-    ? block.nextElementSibling
-    : block.querySelector('.library-metadata');
+  // Extract and strip metadata before generating the block's dom, so it never
+  // leaks into the content that gets copied/inserted or previewed.
+  const metaEl = findMetaEl(block);
   if (metaEl) {
     const md = getLibraryMetadata(metaEl);
+    if (md.name) item.name = md.name;
     if (md.searchtags) item.tags = md.searchtags;
     if (md.description) item.description = md.description;
+    metaEl.remove();
   }
+
+  item.dom = block.dataset?.isgroup ? processGroupBlock(block) : getBlockTableHtml(block);
   return item;
 }
 
@@ -219,16 +241,19 @@ function mergePlugin(list, plugin) {
 }
 
 export async function fetchExtensions(org, site) {
-  const configs = fetchDaConfigs({ org, site });
-  const siteConfig = await configs[configs.length - 1];
-  if (siteConfig?.error) return [];
+  const configs = await Promise.all(fetchDaConfigs({ org, site }));
+  const validConfigs = configs.filter((conf) => !conf?.error).reverse();
+  if (!validConfigs.length) return [];
 
-  const rows = siteConfig?.library?.data;
-  if (!Array.isArray(rows)) return [];
+  const rows = validConfigs.flatMap((conf) => conf?.library?.data || []);
+  if (!rows.length) return [];
 
+  const seen = new Set();
   const extensions = rows.reduce((acc, row) => {
     if (!row.title || !getIsPluginAllowed(row.ref)) return acc;
     const name = row.title.trim().toLowerCase().replaceAll(' ', '-');
+    if (seen.has(name)) return acc;
+    seen.add(name);
     acc.push({
       name,
       title: row.title.trim(),
@@ -242,8 +267,8 @@ export async function fetchExtensions(org, site) {
   }, []);
 
   try {
-    const siteEntries = getFirstSheet(siteConfig) || [];
-    const hasRepo = siteEntries.find((e) => e.key === 'aem.repositoryId')?.value;
+    const entries = validConfigs.flatMap((conf) => getFirstSheet(conf) || []);
+    const hasRepo = entries.find((entry) => entry.key === 'aem.repositoryId')?.value;
     if (hasRepo) {
       const { getAssetsPlugin } = await import('./aem-assets.js');
       const plugin = getAssetsPlugin({ org, site });
@@ -252,6 +277,13 @@ export async function fetchExtensions(org, site) {
   } catch { /* proceed without assets */ }
 
   return extensions;
+}
+
+/** Resolve the configured "blocks" library extension for an org/site, or null. */
+export async function getBlocksExtension(org, site) {
+  if (!org || !site) return null;
+  const extensions = await fetchExtensions(org, site);
+  return extensions?.find((ext) => ext.name === 'blocks') || null;
 }
 
 // ---------------------------------------------------------------------------
@@ -275,6 +307,79 @@ export async function fetchBlocks(sources) {
     } catch { /* skip failed source */ }
   }
   return blocks;
+}
+
+const blockLibraryCache = new Map();
+
+/**
+ * Load — and memoize per org/site — the configured blocks library: the resolved
+ * "blocks" extension plus its fetched blocks (each carrying a lazy `loadVariants`
+ * promise). Shared by the slash-menu prefetch and the block-library modal so the
+ * library (and every variant's HTML) is fetched and parsed at most once.
+ * Resolves to `{ ext: null, blocks: [] }` when no library is configured.
+ */
+export function loadBlockLibrary(org, site) {
+  if (!org || !site) return Promise.resolve({ ext: null, blocks: [] });
+  const key = `${org}/${site}`;
+  if (!blockLibraryCache.has(key)) {
+    const pending = (async () => {
+      const ext = await getBlocksExtension(org, site);
+      if (!ext) return { ext: null, blocks: [] };
+      const blocks = await fetchBlocks(ext.sources);
+      return { ext, blocks };
+    })().catch((err) => {
+      // Don't cache transient failures — allow a later retry.
+      blockLibraryCache.delete(key);
+      throw err;
+    });
+    blockLibraryCache.set(key, pending);
+  }
+  return blockLibraryCache.get(key);
+}
+
+export function resetBlockLibraryCache() {
+  blockLibraryCache.clear();
+}
+
+const librarySheetCache = new Map();
+
+/**
+ * Fetch and memoize a named sheet's rows from the block library sources — e.g.
+ * "options" (per-block key/value autocomplete) or "editor" (multi-block config).
+ * Resolves to [] when no library / sheet is configured.
+ */
+function loadLibrarySheet(org, site, sheet) {
+  if (!org || !site) return Promise.resolve([]);
+  const key = `${sheet}:${org}/${site}`;
+  if (!librarySheetCache.has(key)) {
+    const pending = (async () => {
+      const ext = await getBlocksExtension(org, site);
+      if (!ext) return [];
+      const rows = [];
+      for (const url of ext.sources || []) {
+        try {
+          const resp = await daFetch(url, { noRedirect: true });
+          if (resp.ok) {
+            const json = await resp.json();
+            if (Array.isArray(json?.[sheet]?.data)) rows.push(...json[sheet].data);
+          }
+        } catch { /* skip failed source */ }
+      }
+      return rows;
+    })().catch((err) => {
+      librarySheetCache.delete(key);
+      throw err;
+    });
+    librarySheetCache.set(key, pending);
+  }
+  return librarySheetCache.get(key);
+}
+
+export const loadBlockOptions = (org, site) => loadLibrarySheet(org, site, 'options');
+export const loadBlockEditor = (org, site) => loadLibrarySheet(org, site, 'editor');
+
+export function resetBlockOptionsCache() {
+  librarySheetCache.clear();
 }
 
 export async function fetchItems(sources, format) {
@@ -339,8 +444,8 @@ export async function insertTemplate(view, url) {
   const resp = await daFetch(url);
   if (!resp.ok) return;
   const html = (await resp.text()).replace('class="template-metadata"', 'class="metadata"');
-  const doc = new window.DOMParser().parseFromString(html, 'text/html');
-  const parsed = PMDOMParser.fromSchema(view.state.schema).parse(doc.body);
+  const { dom } = htmlToProse(html);
+  const parsed = PMDOMParser.fromSchema(view.state.schema).parse(dom);
   view.dispatch(view.state.tr.replaceSelectionWith(parsed).scrollIntoView());
 }
 
@@ -351,8 +456,10 @@ export async function insertTemplate(view, url) {
 export async function getPreviewStatus({ org, site, pathname }) {
   const path = `/${org}/${site}${pathname}`;
   try {
-    const json = await aemAdmin(path, 'status', 'GET');
-    if (!json) return null;
+    const { status } = await getNx2Api();
+    const resp = await status.get(path);
+    if (!resp.ok) return null;
+    const json = await resp.json();
     return json.preview?.status === 200;
   } catch {
     return null;
@@ -414,7 +521,42 @@ function createFileExplorerView() {
   };
 }
 
-function extensionToPanelView(ext, section) {
+function createVersioningView() {
+  return {
+    id: 'versions',
+    label: 'Versions',
+    section: 'Editor',
+    firstParty: true,
+    load: async () => {
+      await import('../ew-canvas-versions/ew-canvas-versions.js');
+      return document.createElement('ew-canvas-versions');
+    },
+  };
+}
+
+export function extensionToPanelView(ext, section) {
+  // Block library opens its own dedicated modal (used by the slash menu and
+  // outline "+" button) rather than the generic inline panel or iframe dialog.
+  if (ext.name === 'blocks') {
+    return {
+      id: ext.name,
+      label: ext.title,
+      section,
+      firstParty: ext.ootb,
+      experience: 'modal',
+      icon: ext.icon,
+      openModal: async () => {
+        const { openBlockLibraryModal } = await import('../ew-block-library-modal/ew-block-library-modal.js');
+        openBlockLibraryModal({
+          onInsert: (dom) => {
+            const { view } = getExtensionsBridge();
+            if (view) insertBlock(view, dom);
+          },
+        });
+      },
+    };
+  }
+
   const view = {
     id: ext.name,
     label: ext.title,
@@ -436,7 +578,7 @@ function extensionToPanelView(ext, section) {
       if (ext.name === 'aem-assets') {
         const { renderAssets } = await import('./aem-assets.js');
         await renderAssets({ container, org: ext.org, site: ext.site, onClose });
-        return () => {};
+        return () => { };
       }
 
       const iframe = document.createElement('iframe');
@@ -446,7 +588,7 @@ function extensionToPanelView(ext, section) {
       iframe.allow = 'clipboard-write *';
       container.append(iframe);
 
-      let destroyChannel = () => {};
+      let destroyChannel = () => { };
       iframe.addEventListener('load', async () => {
         let hashState;
         const unsub = hashChange.subscribe((s) => { hashState = s; });
@@ -480,6 +622,7 @@ export async function getCanvasToolPanelViews({ org, site }) {
   return [
     createOutlineView(),
     createFileExplorerView(),
+    createVersioningView(),
     ...library.map((ext) => extensionToPanelView(ext, 'Library')),
     ...thirdParty.map((ext) => extensionToPanelView(ext, 'Extensions')),
   ];

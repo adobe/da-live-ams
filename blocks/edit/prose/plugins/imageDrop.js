@@ -1,7 +1,7 @@
 // eslint-disable-next-line import/no-unresolved
 import { Plugin, PluginKey } from 'da-y-wrapper';
 import getPathDetails from '../../../shared/pathDetails.js';
-import { daFetch } from '../../../shared/utils.js';
+import { getNx2Api } from '../../../../scripts/utils.js';
 
 const imageDropKey = new PluginKey('imageDrop');
 
@@ -13,7 +13,8 @@ export async function uploadImageFile(view, file) {
 
   const { schema } = view.state;
   const details = getPathDetails();
-  const url = `${details.origin}/source${details.parent}/.${details.name}/${file.name}`;
+  const path = `${details.parent}/.${details.name}/${file.name}`;
+  const url = `${details.origin}/source${path}`;
 
   // Use the upload URL as a unique FPO identifier so concurrent uploads can
   // each find their own placeholder by content rather than by stale position.
@@ -21,29 +22,56 @@ export async function uploadImageFile(view, file) {
   const fpo = schema.nodes.image.create({ src: fpoSrc, style: 'width: 180px' });
   view.dispatch(view.state.tr.replaceSelectionWith(fpo));
 
-  const formData = new FormData();
-  formData.append('data', file);
-  const opts = { method: 'PUT', body: formData };
-  const resp = await daFetch(url, opts);
-  if (!resp.ok) return;
+  const { source } = await getNx2Api();
+  const resp = await source.uploadMedia(path, { body: file });
+  if (!resp.ok) {
+    // eslint-disable-next-line no-console
+    console.error(`Failed to upload image "${file.name}": ${resp.status} ${resp.statusText}`);
+    view.state.doc.descendants((node, pos) => {
+      if (node.type.name === 'image' && node.attrs.src === fpoSrc) {
+        view.dispatch(view.state.tr.delete(pos, pos + node.nodeSize));
+        return false;
+      }
+      return true;
+    });
+    const daTitle = document.querySelector('da-title');
+    if (daTitle) {
+      // eslint-disable-next-line no-underscore-dangle
+      daTitle._status = {
+        message: `Couldn't upload "${file.name}"`,
+        details: `Server responded ${resp.status} ${resp.statusText}`.trim(),
+      };
+    }
+    return;
+  }
   const json = await resp.json();
+  const imgSrc = json.source.contentUrl;
 
-  // Create a doc image to pre-download the image before showing it.
-  const docImg = document.createElement('img');
-  docImg.addEventListener('load', () => {
+  let replaced = false;
+  function injectImage() {
     // Find the placeholder by its unique src rather than a stale position so
     // concurrent uploads and collab updates cannot cause the wrong node to be
     // replaced.
-    let replaced = false;
     view.state.doc.descendants((node, pos) => {
       if (!replaced && node.type.name === 'image' && node.attrs.src === fpoSrc) {
         replaced = true;
-        const img = schema.nodes.image.create({ src: json.source.contentUrl });
+        const img = schema.nodes.image.create({ src: imgSrc });
         view.dispatch(view.state.tr.replaceWith(pos, pos + node.nodeSize, img));
       }
     });
-  });
-  docImg.src = json.source.contentUrl;
+  }
+
+  // Create a doc image to pre-download the image before showing it.
+  const docImg = document.createElement('img');
+  docImg.src = imgSrc;
+
+  if (imgSrc.startsWith('./media_')) {
+    // for relative media images, always replace the placeholder (for now)
+    injectImage();
+  } else {
+    // otherwise, wait until the image was loaded
+    docImg.addEventListener('load', injectImage);
+  }
 }
 
 export default function imageDrop() {

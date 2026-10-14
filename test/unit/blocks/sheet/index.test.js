@@ -78,6 +78,78 @@ describe('init - double restore', () => {
   });
 });
 
+describe('finishSetup - structural change handlers', () => {
+  let el;
+  let daTitle;
+  let panes;
+  let savedJspreadsheet;
+  let savedFetch;
+  let savedHash;
+
+  beforeEach(() => {
+    el = document.createElement('div');
+    el.className = 'da-sheet';
+    document.body.appendChild(el);
+
+    daTitle = document.createElement('da-title');
+    daTitle.permissions = [];
+    document.body.appendChild(daTitle);
+
+    panes = document.createElement('da-sheet-panes');
+    document.body.appendChild(panes);
+
+    savedJspreadsheet = window.jspreadsheet;
+    window.jspreadsheet = { tabs: mockJspreadsheetTabs };
+
+    savedFetch = window.fetch;
+    savedHash = window.location.hash;
+  });
+
+  afterEach(() => {
+    el.remove();
+    daTitle.remove();
+    panes.remove();
+    window.jspreadsheet = savedJspreadsheet;
+    window.fetch = savedFetch;
+    if (savedHash) window.location.hash = savedHash;
+    document.querySelectorAll('da-sheet-tabs').forEach((t) => t.remove());
+  });
+
+  // jspreadsheet-ce doesn't fire onafterchanges for row/column delete or row move, so
+  // without their own hooks the change never reaches the server - it just sits in the
+  // in-memory grid until an unrelated cell edit happens to flush it, or is lost on reload.
+  // The actual delete-reload-verify behavior is covered end-to-end in test/e2e. Column move
+  // has no onmovecolumn binding - columnDrag is off, so there's no UI path to reach it.
+  ['ondeleterow', 'ondeletecolumn', 'onmoverow'].forEach((hookName) => {
+    it(`${hookName} schedules a save, matching onafterchanges`, async () => {
+      const data = [{ sheetName: 'data', minDimensions: [20, 20], data: [['Key'], ['A']], columns: [{ width: '300' }] }];
+
+      el.details = { org: 'org', site: 'site', path: '/file', view: 'sheet' };
+      window.location.hash = '#/org/site/file';
+
+      const jexcel = await sh.default(el, data);
+      jexcel[0].getData = () => data[0].data;
+      jexcel[0].getConfig = () => ({ columns: data[0].columns });
+
+      let captured;
+      window.fetch = async (url, opts) => {
+        const urlStr = String(url);
+        if (urlStr.startsWith('https://admin.hlx.page/ping')) {
+          return new Response('', { status: 200, headers: new Headers() });
+        }
+        if (opts?.method === 'POST' && urlStr.includes('/source/')) captured = urlStr;
+        return new Response('', { status: 200 });
+      };
+
+      jexcel[0].options[hookName]();
+      // wait beyond the 1000ms debounce, matching utils-utils.test.js's handleSave test
+      await new Promise((r) => { setTimeout(r, 1200); });
+
+      expect(captured).to.contain('/source/org/site/file');
+    });
+  });
+});
+
 describe('restoreVersion', () => {
   let savedFetch;
   let savedJspreadsheet;
@@ -187,7 +259,8 @@ describe('restoreVersion', () => {
   });
 });
 
-const SOURCE_URL = 'http://example.com/source/org/site/file.json';
+// getData takes pathDetails; source.get rebuilds the admin.da.live URL the mock serves.
+const SOURCE_DETAILS = { org: 'org', site: 'site', path: '/file.json' };
 
 // The new api.js makes two requests: an hlx6 upgrade probe to admin.hlx.page/ping
 // and the actual source fetch. The probe must respond without an
@@ -197,7 +270,7 @@ function buildMockFetch(json) {
     if (url.startsWith('https://admin.hlx.page/ping')) {
       return new Response('', { status: 200, headers: new Headers() });
     }
-    if (url.startsWith('https://admin.da.live/source/')) {
+    if (url.startsWith('https://admin.ent-da.live/source/')) {
       const headers = new Headers();
       headers.append('x-da-actions', '/=read,write');
       return new Response(json, { status: 200, headers });
@@ -225,7 +298,7 @@ describe('Sheets', () => {
     try {
       window.fetch = buildMockFetch(json);
 
-      const sheet = await sh.getData(SOURCE_URL);
+      const sheet = await sh.getData(SOURCE_DETAILS);
       expect(sheet.length).to.equal(1);
       expect(sheet[0].sheetName).to.equal('data');
       expect(sheet[0].data).to.deep.equal([['Value'], ['A'], ['B'], ['C']]);
@@ -265,7 +338,7 @@ describe('Sheets', () => {
     try {
       window.fetch = buildMockFetch(json);
 
-      const sheet = await sh.getData(SOURCE_URL);
+      const sheet = await sh.getData(SOURCE_DETAILS);
       expect(sheet.length).to.equal(2);
       expect(sheet[0].sheetName).to.equal('data');
       expect(sheet[0].data).to.deep.equal([['Tag'], ['red'], ['blue'], ['orange']]);
@@ -314,7 +387,7 @@ describe('Sheets', () => {
     try {
       window.fetch = buildMockFetch(json);
 
-      const sheet = await sh.getData(SOURCE_URL);
+      const sheet = await sh.getData(SOURCE_DETAILS);
       expect(sheet.length).to.equal(2);
       expect(sheet[0].sheetName).to.equal('single-sheet');
       expect(sheet[1].sheetName).to.equal('private-sheet');
@@ -380,7 +453,7 @@ describe('Sheets', () => {
     try {
       window.fetch = buildMockFetch(json);
 
-      const sheet = await sh.getData(SOURCE_URL);
+      const sheet = await sh.getData(SOURCE_DETAILS);
       expect(sheet.length).to.equal(3);
       expect(sheet[0].sheetName).to.equal('sheet1');
       expect(sheet[1].sheetName).to.equal('sheet2');

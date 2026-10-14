@@ -6,6 +6,9 @@ import imageDropPluginFactory, {
 } from '../../../../../../blocks/edit/prose/plugins/imageDrop.js';
 import { createTestEditor, destroyEditor } from '../test-helpers.js';
 
+const { setNx } = await import('../../../../../../scripts/utils.js');
+setNx('/test/fixtures/nx', { hostname: 'example.com' });
+
 const nextFrame = () => new Promise((resolve) => { setTimeout(resolve, 0); });
 
 describe('imageDrop plugin', () => {
@@ -57,15 +60,31 @@ describe('imageDrop plugin', () => {
     }
   });
 
-  it('uploadImageFile bails when daFetch is not ok', async () => {
+  it('uploadImageFile removes the FPO, logs, and shows an error banner when the upload fails', async () => {
     const savedFetch = window.fetch;
-    window.fetch = () => Promise.resolve(new Response('boom', { status: 500 }));
+    const savedConsoleError = console.error;
+    let loggedArgs = null;
+    console.error = (...args) => { loggedArgs = args; };
+    window.fetch = () => Promise.resolve(new Response('boom', { status: 403, statusText: 'Forbidden' }));
+    const daTitle = document.createElement('da-title');
+    document.body.append(daTitle);
     try {
       const file = new File(['x'], 'pic.png', { type: 'image/png' });
       await uploadImageFile(editor.view, file);
-      // FPO is still inserted; we just verify no throw.
+      let foundImg = false;
+      editor.view.state.doc.descendants((node) => {
+        if (node.type.name === 'image') foundImg = true;
+      });
+      expect(foundImg).to.be.false;
+      expect(loggedArgs).to.not.be.null;
+      expect(loggedArgs[0]).to.include('pic.png');
+      expect(daTitle._status).to.not.be.undefined;
+      expect(daTitle._status.message).to.include('pic.png');
+      expect(daTitle._status.details).to.include('403');
     } finally {
       window.fetch = savedFetch;
+      console.error = savedConsoleError;
+      daTitle.remove();
     }
   });
 
@@ -144,6 +163,51 @@ describe('imageDrop plugin', () => {
       expect(fpoSrcs[0]).to.not.equal(fpoSrcs[1]);
       expect(fpoSrcs[0]).to.include('alpha.png');
       expect(fpoSrcs[1]).to.include('beta.gif');
+    } finally {
+      window.fetch = savedFetch;
+    }
+  });
+
+  it('uploadImageFile uploads via source.uploadMedia (not source.save)', async () => {
+    const savedFetch = window.fetch;
+    let requestUrl = null;
+    let requestMethod = null;
+    window.fetch = (url, opts) => {
+      requestUrl = url;
+      requestMethod = opts?.method;
+      return Promise.resolve(new Response(
+        JSON.stringify({ source: { contentUrl: '/path/uploaded.png' } }),
+        { status: 200 },
+      ));
+    };
+    try {
+      const file = new File(['x'], 'pic.png', { type: 'image/png' });
+      await uploadImageFile(editor.view, file);
+      expect(requestUrl).to.be.a('string');
+      expect(requestUrl).to.include('/pic.png');
+      expect(requestMethod).to.equal('POST');
+    } finally {
+      window.fetch = savedFetch;
+    }
+  });
+
+  it('uploadImageFile replaces the FPO immediately for relative media URLs, without waiting for load', async () => {
+    const mediaUrl = './media_abc123.png?width=750&format=webply';
+    const savedFetch = window.fetch;
+    window.fetch = () => Promise.resolve(new Response(
+      JSON.stringify({ source: { contentUrl: mediaUrl } }),
+      { status: 200 },
+    ));
+    try {
+      const file = new File(['x'], 'pic.png', { type: 'image/png' });
+      await uploadImageFile(editor.view, file);
+      // No extra wait for the img "load" event — the relative media src
+      // should already have replaced the FPO by the time upload resolves.
+      let finalSrc = null;
+      editor.view.state.doc.descendants((node) => {
+        if (node.type.name === 'image') finalSrc = node.attrs.src;
+      });
+      expect(finalSrc).to.equal(mediaUrl);
     } finally {
       window.fetch = savedFetch;
     }
