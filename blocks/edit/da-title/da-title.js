@@ -11,7 +11,8 @@ import getSheet from '../../shared/sheet.js';
 
 const sheet = await getSheet('/blocks/edit/da-title/da-title.css');
 
-const SK_EXT_ID = 'igkmdomcgoebiipaifhmpfjhbjccggml';
+// Pinned AMS Sidekick ID (SIDEKICK_PIN_ID build of aem-sidekick-ams), not Adobe's store ID.
+const SK_EXT_ID = 'bobfaahioddffdkhnphohpkoehmcedib';
 const LAZY_DELAY = 1500;
 const ICONS = [
   '/blocks/edit/img/Smock_Cloud_18_N.svg',

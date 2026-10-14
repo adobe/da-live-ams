@@ -24,7 +24,7 @@ import {
 
 import { getSchema } from 'da-parser';
 import { COLLAB_ORIGIN, DA_ORIGIN } from '../../shared/constants.js';
-import { getAuthToken } from '../../shared/utils.js';
+import { getAuthToken, initIms, resolveAuthModule } from '../../shared/utils.js';
 import { getNx2Api } from '../../../scripts/utils.js';
 import { getDiffClass, checkForLocNodes, addActiveView } from './diff/diff-utils.js';
 import { debounce, initDaMetadata } from '../utils/helpers.js';
@@ -90,12 +90,28 @@ export async function createConnection(path) {
       provider.shouldConnect = false;
       // Force imslib to attempt a refresh before deciding to give up.
       try { await window.adobeIMS?.refreshToken?.(); } catch { /* ignore */ }
-      const fresh = await getAuthToken();
+      let fresh = await getAuthToken();
+      if ((!fresh || fresh === lastSentToken) && org && site) {
+        // getAuthToken() only ever returns initIms()'s memoized, page-load-time token — it
+        // never learns about a site-scoped token minted later by daFetch's own upgrade (see
+        // shared/utils.js). Without this, a connection opened with the alt provider's
+        // account-level token 4401s here forever even though a working site token exists.
+        const { useAlt } = await resolveAuthModule();
+        if (useAlt) {
+          const { getAemSiteToken } = await getNx2Api();
+          const { siteToken } = await getAemSiteToken({ org, site });
+          if (siteToken) fresh = siteToken;
+        }
+      }
       if (!fresh || fresh === lastSentToken) {
         // No new token to try — retrying would loop on the same 4401. Stop
         // the reconnect loop, and surface the modal if the user was signed in.
         if (lastSentToken) {
           try {
+            // Guarantees isAvailable()/loadIms() have resolved before the banner's button can
+            // be clicked — this WS disconnect can fire before loadPage()'s own initIms() call
+            // has settled (see the identical fix in shared/utils.js's daFetch()).
+            await initIms();
             const { showAuthBanner } = await import('../../shared/da-auth-banner/da-auth-banner.js');
             showAuthBanner();
           } catch { /* ignore */ }
@@ -546,6 +562,15 @@ export default async function initProse({ path, permissions, doc, daContent, wsP
         name: profile.displayName,
         id: profile.userId,
       });
+    });
+  } else if ((await initIms())?.email) {
+    // The alt provider has no displayName/userId (see helix-admin-auth.js's loadIms) — email
+    // is all there is to identify this user to collaborators by.
+    const { email } = await initIms();
+    wsProvider.awareness.setLocalStateField('user', {
+      color: generateColor(email),
+      name: email,
+      id: email,
     });
   } else {
     wsProvider.awareness.setLocalStateField('user', {

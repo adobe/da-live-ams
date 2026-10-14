@@ -1,0 +1,41 @@
+// Mock helix-admin-auth.js for tests
+//
+// Anchored on window rather than a plain module-scope binding: initIms() reaches this file
+// through a dynamic, runtime-computed import() specifier, which @web/dev-server-import-maps
+// can't rewrite the way it rewrites this file's own static import in the test (confirmed
+// empirically — the two import styles resolve to different query strings, landing as two
+// separate module instances with independent state otherwise). window is guaranteed shared
+// across both, same as this suite already relies on for window.adobeIMS elsewhere.
+window.__helixAdminAuthTestState ??= {
+  available: false,
+  token: null,
+  email: null,
+  name: null,
+  silentToken: null,
+  throwOnLoad: false,
+};
+export const testState = window.__helixAdminAuthTestState;
+
+export function isAvailable() {
+  return Promise.resolve(testState.available);
+}
+
+export async function loadIms() {
+  if (testState.throwOnLoad) throw new Error('boom');
+  if (!testState.token && testState.silentToken) {
+    // Mimics the real provider signing in silently from an existing session during startup.
+    await new Promise((resolve) => { setTimeout(resolve, 20); });
+    localStorage.setItem('nx-ims', true);
+    return { accessToken: { token: testState.silentToken } };
+  }
+  if (!testState.token) return { anonymous: true };
+  return {
+    accessToken: { token: testState.token },
+    ...(testState.email ? { email: testState.email } : {}),
+    ...(testState.name ? { name: testState.name } : {}),
+  };
+}
+
+export function handleSignIn() {}
+
+export function handleSignOut() {}

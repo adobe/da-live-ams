@@ -17,6 +17,11 @@ const ALLOWED_TOKEN = [...DA_ORIGINS, ...AEM_ORIGINS, ...ETC_ORIGINS];
 let imsDetails;
 let authMonitorAttached = false;
 
+// window.location.reload is a non-configurable, non-writable own property in real browsers —
+// tests can't stub or reassign it directly. Indirecting through a plain, mutable object gives
+// tests a seam without changing behavior (same pattern as helix-admin-auth.js's testHooks).
+export const testHooks = { reload: () => window.location.reload() };
+
 // Watch imslib's session for cross-tab sign-in/out. imslib persists its
 // token in localStorage and other tabs' writes fire storage events here;
 // re-check the live auth state on every storage change so we react
@@ -41,21 +46,73 @@ function attachAuthMonitor() {
   });
 }
 
+// Single, shared "which provider, and its module" resolution — initIms() below, da-auth-banner.js's
+// triggerSignIn(), and da-auth-status.js's sign-in/out button all need this same pick, and used
+// to each carry their own copy. Consolidated after one of those copies (daFetch.js's, in a sibling
+// repo) went missing for a full review cycle before anyone noticed a drift.
+export async function resolveAuthModule() {
+  const nxBase = getNx();
+  // Kick off the (lazy, side-effecting) ims.js import before awaiting the alt-provider
+  // module below, so both fetches start back to back rather than one waiting on the
+  // other — a deployment with no alternate idp configured (the common case) shouldn't
+  // pay for that fetch to fully settle before ims.js's own even begins. Caught here
+  // (rather than left to reject the Promise.all below) so a hiccup loading the module the
+  // alt-provider path doesn't even need can't take down the path that does.
+  const imsModulePromise = import(`${nxBase}/utils/ims.js`).catch(() => null);
+  // helix-admin-auth.js only exists under nx1's path, never nx2's (confirmed directly
+  // against hlx6-da-nx) — nxBase can be nx2-suffixed depending on the page's nxver, so this
+  // strips a trailing "2" rather than using nxBase as-is.
+  const nx1Base = nxBase.replace(/2$/, '');
+  const altAuth = await import(`${nx1Base}/utils/helix-admin-auth.js`);
+  const [useAlt, imsModule] = await Promise.all([
+    altAuth.isAvailable(),
+    imsModulePromise,
+  ]);
+  return { useAlt, authModule: useAlt ? altAuth : imsModule };
+}
+
 export async function initIms() {
   if (imsDetails) return imsDetails;
   try {
-    const { loadIms } = await import(`${getNx()}/utils/ims.js`);
-    imsDetails = await loadIms();
-    attachAuthMonitor();
+    const { useAlt, authModule } = await resolveAuthModule();
+    if (!authModule) return null; // ims.js failed to load and it's the one needed here
+    imsDetails = await authModule.loadIms();
+    // attachAuthMonitor watches window.adobeIMS, which the alternate provider never sets.
+    if (!useAlt) attachAuthMonitor();
     return imsDetails;
   } catch {
     return null;
   }
 }
 
+// IMS's own sign-in is a gesture-free redirect, safely triggered reactively from wherever a
+// request first needs it. The alt provider's is a popup, which needs a real click behind it —
+// loadIms() is awaited first so the click handler's own handleSignIn() call runs synchronously
+// in the same task as the click (see helix-admin-auth.js), not after a pending await.
+export async function signIn() {
+  const { authModule } = await resolveAuthModule();
+  if (!authModule) return;
+  await authModule.loadIms();
+  authModule.handleSignIn();
+}
+
+// The alt provider's handleSignOut() only clears local state, no redirect of its own (unlike
+// IMS's, which navigates) — reload so every part of the page (da-auth-status included) picks
+// up the now-signed-out state instead of only clearing storage underneath still-rendered UI.
+export async function signOut() {
+  const { authModule } = await resolveAuthModule();
+  authModule?.handleSignOut();
+  testHooks.reload();
+}
+
 export async function getAuthToken() {
   if (!localStorage.getItem('nx-ims')) {
-    return null;
+    // The alt provider may sign in silently while initIms() runs; going anonymous before that
+    // settles sends requests that 401. IMS has nothing to wait for.
+    const { useAlt } = await resolveAuthModule();
+    if (!useAlt) return null;
+    await initIms();
+    if (!localStorage.getItem('nx-ims')) return null;
   }
   // imslib auto-refreshes its internal token; reading it live avoids returning the
   // page-load snapshot that nx's loadIms() captured once in its onReady handler.
@@ -66,7 +123,19 @@ export async function getAuthToken() {
   return ims?.accessToken?.token || null;
 }
 
-export const daFetch = async (url, opts = {}) => {
+// DA admin API URLs all follow `{origin}/{op}/{org}/{site}/{path...}` — used as a fallback
+// when a caller doesn't pass `{org, site}` explicitly, so the site-token upgrade below still
+// runs for those call sites instead of skipping straight to the no-access redirect.
+function parseOrgSiteFromUrl(url) {
+  try {
+    const [, , org, site] = new URL(url).pathname.split('/');
+    return { org, site };
+  } catch {
+    return {};
+  }
+}
+
+export const daFetch = async (url, opts = {}, { org, site } = {}) => {
   opts.headers = opts.headers || {};
   const setBearer = (tok) => {
     const canToken = ALLOWED_TOKEN.some((origin) => new URL(url).origin === origin);
@@ -78,12 +147,30 @@ export const daFetch = async (url, opts = {}) => {
   };
 
   const accessToken = await getAuthToken();
-  if (accessToken) setBearer(accessToken);
+  const isDaOrigin = DA_ORIGINS.some((origin) => url.startsWith(origin));
+
+  // The alt provider's account-level token (no site/org yet — see helix-admin-ams's
+  // getTransientAccountTokenInfo) can't satisfy da-admin's per-site audience check, so it
+  // would 401 on every call. IMS never hits this: its token already works for any site.
+  // Mirrors nx2/utils/api.js's daFetch (hlx6-da-nx). Falls back to parsing org/site from the
+  // URL when the caller doesn't pass them, so every DA-origin call site gets the upgrade.
+  // Done up front, not after a 401: the exchange is cached per site, so a failed one just
+  // leaves the account-level token in use.
+  let token = accessToken;
+  const target = (org && site) ? { org, site } : parseOrgSiteFromUrl(url);
+  if (accessToken && isDaOrigin && target.org && target.site) {
+    const { useAlt } = await resolveAuthModule();
+    if (useAlt) {
+      const { getAemSiteToken } = await getNx2Api();
+      const { siteToken } = await getAemSiteToken(target);
+      if (siteToken) token = siteToken;
+    }
+  }
+  if (token) setBearer(token);
 
   let resp = await fetch(url, opts);
 
-  if (resp.status === 401 && opts.noRedirect !== true
-    && DA_ORIGINS.some((origin) => url.startsWith(origin))) {
+  if (resp.status === 401 && opts.noRedirect !== true && isDaOrigin) {
     // Silent recovery: another tab may have just refreshed/signed in. Ask imslib
     // for a fresh token and retry once before any user-visible disruption.
     let refreshed = null;
@@ -102,6 +189,11 @@ export const daFetch = async (url, opts = {}) => {
       }
       // eslint-disable-next-line no-console
       console.warn('You need to sign in because you are not authorized to access this page', url);
+      // Guarantees isAvailable()/loadIms() have resolved (initIms() memoizes) before the banner's
+      // button can be clicked — daFetch() can 401 before loadPage()'s own initIms() call has
+      // settled, and the alt provider's handleSignIn() needs that resolved by click time, not
+      // still pending (see da-auth-banner.js's triggerSignIn()).
+      await initIms();
       const { showAuthBanner } = await import('./da-auth-banner/da-auth-banner.js');
       showAuthBanner();
     }
